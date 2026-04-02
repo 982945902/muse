@@ -50,6 +50,13 @@ impl Parser for PdfParser {
                             file_name: input.file_name.clone(),
                             mime_type: input.mime_type.clone(),
                             bytes,
+                            request_id: None,
+                            source_type: Some(input.source_type.clone()),
+                            page_no_hint: None,
+                            metadata: std::collections::HashMap::from([(
+                                "pdf_ocr_input".to_string(),
+                                "original_pdf_bytes".to_string(),
+                            )]),
                         })
                         .await?,
                     "original_pdf_bytes",
@@ -190,6 +197,30 @@ impl Parser for PdfParser {
                 "ocr_transport".to_string(),
                 self.ocr.transport_name().to_string(),
             );
+            if let Some(request_id) = ocr_output.request_id {
+                document
+                    .metadata
+                    .extra
+                    .insert("ocr_request_id".to_string(), request_id);
+            }
+            if let Some(timing_ms) = ocr_output.timing_ms {
+                document
+                    .metadata
+                    .extra
+                    .insert("ocr_timing_ms".to_string(), timing_ms.to_string());
+            }
+            if !ocr_output.warnings.is_empty() {
+                document.metadata.extra.insert(
+                    "ocr_warning_count".to_string(),
+                    ocr_output.warnings.len().to_string(),
+                );
+                for (index, warning) in ocr_output.warnings.into_iter().enumerate() {
+                    document
+                        .metadata
+                        .extra
+                        .insert(format!("ocr_warning_{}", index + 1), warning);
+                }
+            }
         }
         Ok(document)
     }
@@ -238,6 +269,13 @@ impl PdfParser {
                     file_name: input.file_name.clone(),
                     mime_type: raster_page.mime_type.clone(),
                     bytes: raster_page.bytes.clone(),
+                    request_id: None,
+                    source_type: Some(input.source_type.clone()),
+                    page_no_hint: Some(raster_page.page_no.max(1)),
+                    metadata: std::collections::HashMap::from([(
+                        "pdf_ocr_input".to_string(),
+                        "page_rasters".to_string(),
+                    )]),
                 })
                 .await?;
 
@@ -254,6 +292,16 @@ impl PdfParser {
                     width: page.width,
                     height: page.height,
                     rotation_degrees: page.rotation_degrees,
+                    request_id: page
+                        .request_id
+                        .clone()
+                        .or_else(|| output.request_id.clone()),
+                    timing_ms: page.timing_ms.or(output.timing_ms),
+                    warnings: if page.warnings.is_empty() {
+                        output.warnings.clone()
+                    } else {
+                        page.warnings.clone()
+                    },
                 });
             } else {
                 pages.push(OcrPage {
@@ -265,6 +313,9 @@ impl PdfParser {
                         .ok()
                         .map(|image| image.height() as f32),
                     rotation_degrees: None,
+                    request_id: output.request_id.clone(),
+                    timing_ms: output.timing_ms,
+                    warnings: output.warnings.clone(),
                 });
             }
 
@@ -285,10 +336,17 @@ impl PdfParser {
             }));
         }
 
+        let request_id = aggregate_ocr_request_id(&pages);
+        let timing_ms = aggregate_ocr_timing_ms(&pages);
+        let warnings = aggregate_ocr_warnings(&pages);
+
         Ok(OcrOutput {
             pages,
             blocks,
             lines,
+            request_id,
+            timing_ms,
+            warnings,
             provider,
             model,
         })
@@ -314,6 +372,30 @@ fn apply_ocr_page_metadata(
                     format!("ocr_page_{}_rotation_degrees", page_no),
                     rotation.to_string(),
                 );
+            }
+            if let Some(request_id) = ocr_page.request_id.as_deref() {
+                metadata.insert(
+                    format!("ocr_page_{}_request_id", page_no),
+                    request_id.to_string(),
+                );
+            }
+            if let Some(timing_ms) = ocr_page.timing_ms {
+                metadata.insert(
+                    format!("ocr_page_{}_timing_ms", page_no),
+                    timing_ms.to_string(),
+                );
+            }
+            if !ocr_page.warnings.is_empty() {
+                metadata.insert(
+                    format!("ocr_page_{}_warning_count", page_no),
+                    ocr_page.warnings.len().to_string(),
+                );
+                for (index, warning) in ocr_page.warnings.iter().enumerate() {
+                    metadata.insert(
+                        format!("ocr_page_{}_warning_{}", page_no, index + 1),
+                        warning.clone(),
+                    );
+                }
             }
         }
         metadata.insert(
@@ -343,4 +425,38 @@ fn apply_ocr_page_metadata(
             .to_string(),
         );
     }
+}
+
+fn aggregate_ocr_request_id(pages: &[OcrPage]) -> Option<String> {
+    let mut unique = pages
+        .iter()
+        .filter_map(|page| page.request_id.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if unique.len() == 1 {
+        unique.pop()
+    } else {
+        None
+    }
+}
+
+fn aggregate_ocr_timing_ms(pages: &[OcrPage]) -> Option<u64> {
+    let mut total = 0_u64;
+    let mut seen = false;
+    for timing_ms in pages.iter().filter_map(|page| page.timing_ms) {
+        seen = true;
+        total = total.saturating_add(timing_ms);
+    }
+    seen.then_some(total)
+}
+
+fn aggregate_ocr_warnings(pages: &[OcrPage]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for warning in pages.iter().flat_map(|page| page.warnings.iter()) {
+        if !warnings.iter().any(|existing| existing == warning) {
+            warnings.push(warning.clone());
+        }
+    }
+    warnings
 }

@@ -760,6 +760,9 @@ async fn publish_document_events(state: &Arc<AppState>, task_id: &str, document:
                     "ocr_provider": document.metadata.extra.get("ocr_provider"),
                     "ocr_model": document.metadata.extra.get("ocr_model"),
                     "ocr_transport": document.metadata.extra.get("ocr_transport"),
+                    "ocr_request_id": lookup_ocr_page_request_id(&document.metadata, page.page_no),
+                    "ocr_timing_ms": lookup_ocr_page_timing_ms(&document.metadata, page.page_no),
+                    "ocr_warnings": collect_ocr_page_warnings(&document.metadata, page.page_no),
                     "ocr_blocks_preview": build_ocr_blocks_preview(page),
                     "pdf_ocr_input": document.metadata.extra.get("pdf_ocr_input"),
                     "pdf_raster_provider": document.metadata.extra.get("pdf_raster_provider"),
@@ -777,6 +780,13 @@ fn lookup_ocr_page_rotation_degrees(metadata: &DocumentMetadata, page_no: u32) -
         .and_then(|value| value.parse::<f32>().ok())
 }
 
+fn lookup_ocr_page_request_id(metadata: &DocumentMetadata, page_no: u32) -> Option<&String> {
+    metadata
+        .extra
+        .get(&format!("ocr_page_{}_request_id", page_no))
+        .or_else(|| metadata.extra.get("ocr_request_id"))
+}
+
 fn lookup_ocr_page_usize_metric(
     metadata: &DocumentMetadata,
     page_no: u32,
@@ -786,6 +796,38 @@ fn lookup_ocr_page_usize_metric(
         .extra
         .get(&format!("ocr_page_{}_{}", page_no, metric))
         .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn lookup_ocr_page_timing_ms(metadata: &DocumentMetadata, page_no: u32) -> Option<u64> {
+    metadata
+        .extra
+        .get(&format!("ocr_page_{}_timing_ms", page_no))
+        .or_else(|| metadata.extra.get("ocr_timing_ms"))
+        .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn collect_ocr_page_warnings(metadata: &DocumentMetadata, page_no: u32) -> Vec<String> {
+    let page_warning_count = metadata
+        .extra
+        .get(&format!("ocr_page_{}_warning_count", page_no))
+        .and_then(|value| value.parse::<usize>().ok());
+    let warning_count = page_warning_count.unwrap_or_else(|| {
+        metadata
+            .extra
+            .get("ocr_warning_count")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0)
+    });
+
+    (1..=warning_count)
+        .filter_map(|index| {
+            metadata
+                .extra
+                .get(&format!("ocr_page_{}_warning_{}", page_no, index))
+                .cloned()
+                .or_else(|| metadata.extra.get(&format!("ocr_warning_{index}")).cloned())
+        })
+        .collect()
 }
 
 fn build_ocr_blocks_preview(page: &PageIr) -> Vec<serde_json::Value> {
@@ -1636,6 +1678,9 @@ mod tests {
                     width: Some(image.width() as f32),
                     height: Some(image.height() as f32),
                     rotation_degrees: None,
+                    request_id: None,
+                    timing_ms: None,
+                    warnings: vec![],
                 }],
                 blocks: vec![],
                 lines: vec![OcrLine {
@@ -1650,6 +1695,9 @@ mod tests {
                     }),
                     confidence: Some(0.95),
                 }],
+                request_id: None,
+                timing_ms: None,
+                warnings: vec![],
                 provider: Some("raster-aware-ocr".to_string()),
                 model: Some("png-page-model".to_string()),
             })
@@ -1691,6 +1739,9 @@ mod tests {
                     width: Some(image.width() as f32),
                     height: Some(image.height() as f32),
                     rotation_degrees: Some(270.0),
+                    request_id: Some("rotating-image-ocr-req-1".to_string()),
+                    timing_ms: Some(31),
+                    warnings: vec!["page rotated during OCR".to_string()],
                 }],
                 blocks: vec![],
                 lines: vec![OcrLine {
@@ -1705,6 +1756,9 @@ mod tests {
                     }),
                     confidence: Some(0.98),
                 }],
+                request_id: Some("rotating-image-ocr-req-1".to_string()),
+                timing_ms: Some(31),
+                warnings: vec!["page rotated during OCR".to_string()],
                 provider: Some("rotating-image-ocr".to_string()),
                 model: Some("rotating-image-model".to_string()),
             })
@@ -1996,6 +2050,15 @@ mod tests {
         assert_eq!(
             page_ocr_done.payload.get("ocr_transport"),
             Some(&json!("inproc"))
+        );
+        assert_eq!(
+            page_ocr_done.payload.get("ocr_request_id"),
+            Some(&json!("rotating-image-ocr-req-1"))
+        );
+        assert_eq!(page_ocr_done.payload.get("ocr_timing_ms"), Some(&json!(31)));
+        assert_eq!(
+            page_ocr_done.payload.get("ocr_warnings"),
+            Some(&json!(["page rotated during OCR"]))
         );
         assert_eq!(
             page_ocr_done.payload.get("rotation_degrees"),
@@ -2312,6 +2375,33 @@ mod tests {
         metadata
             .extra
             .insert("ocr_page_1_rotation_degrees".to_string(), "90".to_string());
+        metadata.extra.insert(
+            "ocr_page_1_request_id".to_string(),
+            "ocr-page-req-pdf-1".to_string(),
+        );
+        metadata
+            .extra
+            .insert("ocr_page_1_timing_ms".to_string(), "41".to_string());
+        metadata
+            .extra
+            .insert("ocr_page_1_warning_count".to_string(), "1".to_string());
+        metadata.extra.insert(
+            "ocr_page_1_warning_1".to_string(),
+            "page-scoped OCR warning".to_string(),
+        );
+        metadata
+            .extra
+            .insert("ocr_request_id".to_string(), "ocr-req-pdf-1".to_string());
+        metadata
+            .extra
+            .insert("ocr_timing_ms".to_string(), "58".to_string());
+        metadata
+            .extra
+            .insert("ocr_warning_count".to_string(), "1".to_string());
+        metadata.extra.insert(
+            "ocr_warning_1".to_string(),
+            "page rotated by OCR classifier".to_string(),
+        );
 
         publish_document_events(
             &state,
@@ -2366,6 +2456,15 @@ mod tests {
         assert_eq!(
             page_ocr_done.payload.get("rotation_degrees"),
             Some(&serde_json::json!(90.0))
+        );
+        assert_eq!(
+            page_ocr_done.payload.get("ocr_request_id"),
+            Some(&json!("ocr-page-req-pdf-1"))
+        );
+        assert_eq!(page_ocr_done.payload.get("ocr_timing_ms"), Some(&json!(41)));
+        assert_eq!(
+            page_ocr_done.payload.get("ocr_warnings"),
+            Some(&json!(["page-scoped OCR warning"]))
         );
         let preview = page_ocr_done
             .payload

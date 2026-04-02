@@ -3524,6 +3524,227 @@ mod tests {
         assert!(result.fields[0].evidences[0].text.contains("图片运营"));
     }
 
+    #[cfg(feature = "onnx-runtime")]
+    #[test]
+    fn tokenized_uie_input_adapter_builds_fixed_shape_inputs_and_page_spans() {
+        let adapter = TokenizedUieInputAdapter {
+            tokenizer: build_test_uie_tokenizer(12),
+            input_ids_name: "input_ids".to_string(),
+            attention_mask_name: "attention_mask".to_string(),
+            token_type_ids_name: Some("token_type_ids".to_string()),
+            max_length: 12,
+        };
+        let schema = SchemaSpec {
+            name: "demo".to_string(),
+            version: "1".to_string(),
+            fields: vec![
+                FieldSpec {
+                    key: "role".to_string(),
+                    field_type: FieldType::String,
+                    required: false,
+                    multiple: false,
+                    children: vec![],
+                    hints: vec![],
+                },
+                FieldSpec {
+                    key: "profile".to_string(),
+                    field_type: FieldType::Object,
+                    required: false,
+                    multiple: false,
+                    children: vec![FieldSpec {
+                        key: "city".to_string(),
+                        field_type: FieldType::String,
+                        required: false,
+                        multiple: false,
+                        children: vec![],
+                        hints: vec![],
+                    }],
+                    hints: vec![],
+                },
+            ],
+        };
+        let doc = sample_document("image ops shanghai", vec!["image ops shanghai"]);
+
+        let prepared = adapter
+            .build_inputs(&doc, &schema)
+            .expect("build tokenized inputs");
+
+        assert_eq!(prepared.inputs.items.len(), 3);
+        for input in &prepared.inputs.items {
+            assert_eq!(input.name, input.name.trim());
+            match &input.payload {
+                OnnxInputPayload::Int64Tensor { shape, .. } => {
+                    assert_eq!(shape, &vec![2, 12]);
+                }
+                other => panic!("unexpected payload: {other:?}"),
+            }
+        }
+
+        let OnnxPreparedContext::Uie(context) = prepared.context else {
+            panic!("expected UIE prepared context");
+        };
+        assert_eq!(context.plans.len(), 2);
+        assert_eq!(context.plans[0].field_path, vec!["role".to_string()]);
+        assert_eq!(
+            context.plans[1].field_path,
+            vec!["profile".to_string(), "city".to_string()]
+        );
+
+        let first_plan_spans = context.plans[0]
+            .token_spans
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(first_plan_spans.contains(&UieTokenSpan {
+            start_char: 0,
+            end_char: 5,
+        }));
+        assert!(first_plan_spans.contains(&UieTokenSpan {
+            start_char: 6,
+            end_char: 9,
+        }));
+        assert!(first_plan_spans.contains(&UieTokenSpan {
+            start_char: 10,
+            end_char: 18,
+        }));
+    }
+
+    #[cfg(feature = "onnx-runtime")]
+    #[test]
+    fn tokenized_uie_input_adapter_slides_long_documents_into_overlapping_windows() {
+        let adapter = TokenizedUieInputAdapter {
+            tokenizer: build_test_uie_tokenizer(8),
+            input_ids_name: "input_ids".to_string(),
+            attention_mask_name: "attention_mask".to_string(),
+            token_type_ids_name: Some("token_type_ids".to_string()),
+            max_length: 8,
+        };
+        let schema = SchemaSpec {
+            name: "demo".to_string(),
+            version: "1".to_string(),
+            fields: vec![FieldSpec {
+                key: "role".to_string(),
+                field_type: FieldType::String,
+                required: false,
+                multiple: false,
+                children: vec![],
+                hints: vec![],
+            }],
+        };
+        let doc = sample_document(
+            "alpha beta gamma delta epsilon zeta eta theta iota kappa",
+            vec!["alpha beta gamma delta epsilon zeta eta theta iota kappa"],
+        );
+
+        let prepared = adapter
+            .build_inputs(&doc, &schema)
+            .expect("build tokenized inputs");
+
+        let OnnxPreparedContext::Uie(context) = prepared.context else {
+            panic!("expected UIE prepared context");
+        };
+        assert!(context.plans.len() > 1);
+
+        let mut seen = std::collections::HashMap::new();
+        for plan in &context.plans {
+            let mapped_spans = plan.token_spans.iter().flatten().collect::<Vec<_>>();
+            assert!(!mapped_spans.is_empty());
+            for span in mapped_spans {
+                *seen
+                    .entry((span.start_char, span.end_char))
+                    .or_insert(0_u32) += 1;
+            }
+        }
+        assert!(seen.values().any(|count| *count > 1));
+    }
+
+    #[cfg(feature = "onnx-runtime")]
+    #[test]
+    fn uie_output_adapter_dedupes_same_span_from_multiple_windows() {
+        let adapter = UieSpanOutputAdapter::new("start_probs".to_string(), "end_probs".to_string());
+        let schema = SchemaSpec {
+            name: "demo".to_string(),
+            version: "1".to_string(),
+            fields: vec![FieldSpec {
+                key: "role".to_string(),
+                field_type: FieldType::String,
+                required: false,
+                multiple: false,
+                children: vec![],
+                hints: vec![],
+            }],
+        };
+        let doc = sample_document("image ops growth", vec!["image ops growth"]);
+        let context = OnnxPreparedContext::Uie(UiePreparedContext {
+            plans: vec![
+                UieFieldWindowPlan {
+                    field_path: vec!["role".to_string()],
+                    token_spans: vec![
+                        None,
+                        None,
+                        None,
+                        Some(UieTokenSpan {
+                            start_char: 0,
+                            end_char: 5,
+                        }),
+                        Some(UieTokenSpan {
+                            start_char: 6,
+                            end_char: 9,
+                        }),
+                    ],
+                },
+                UieFieldWindowPlan {
+                    field_path: vec!["role".to_string()],
+                    token_spans: vec![
+                        None,
+                        None,
+                        None,
+                        Some(UieTokenSpan {
+                            start_char: 0,
+                            end_char: 5,
+                        }),
+                        Some(UieTokenSpan {
+                            start_char: 6,
+                            end_char: 9,
+                        }),
+                    ],
+                },
+            ],
+        });
+        let outputs = OnnxOutputs {
+            items: HashMap::from([
+                (
+                    "start_probs".to_string(),
+                    OnnxOutputPayload::FloatTensor {
+                        values: vec![0.0, 0.0, 0.0, 0.94, 0.01, 0.0, 0.0, 0.0, 0.95, 0.02],
+                        shape: vec![2, 5],
+                    },
+                ),
+                (
+                    "end_probs".to_string(),
+                    OnnxOutputPayload::FloatTensor {
+                        values: vec![0.0, 0.0, 0.0, 0.01, 0.96, 0.0, 0.0, 0.0, 0.03, 0.97],
+                        shape: vec![2, 5],
+                    },
+                ),
+            ]),
+        };
+
+        let result = adapter
+            .decode(outputs, &context, &doc, &schema)
+            .expect("decode uie float outputs");
+
+        assert_eq!(result.fields.len(), 1);
+        assert_eq!(
+            result.fields[0].value,
+            Value::String("image ops".to_string())
+        );
+        assert!(result.fields[0].confidence.unwrap_or_default() > 0.9);
+        assert_eq!(result.fields[0].evidences.len(), 1);
+        assert_eq!(result.fields[0].evidences[0].page_no, Some(1));
+    }
+
     #[test]
     fn explicit_missing_onnx_spec_path_returns_error() {
         let model_path =
@@ -3567,5 +3788,58 @@ mod tests {
             plain_text: plain_text.to_string(),
             metadata: DocumentMetadata::default(),
         }
+    }
+
+    #[cfg(feature = "onnx-runtime")]
+    fn build_test_uie_tokenizer(max_length: usize) -> Tokenizer {
+        use tokenizers::models::wordlevel::WordLevel;
+        use tokenizers::pre_tokenizers::whitespace::Whitespace;
+        use tokenizers::processors::template::TemplateProcessing;
+
+        let vocab = [
+            ("[UNK]".to_string(), 0_u32),
+            ("[PAD]".to_string(), 1_u32),
+            ("[CLS]".to_string(), 2_u32),
+            ("[SEP]".to_string(), 3_u32),
+            ("role".to_string(), 4_u32),
+            ("profile".to_string(), 5_u32),
+            ("city".to_string(), 6_u32),
+            ("image".to_string(), 7_u32),
+            ("ops".to_string(), 8_u32),
+            ("shanghai".to_string(), 9_u32),
+            ("alpha".to_string(), 10_u32),
+            ("beta".to_string(), 11_u32),
+            ("gamma".to_string(), 12_u32),
+            ("delta".to_string(), 13_u32),
+            ("epsilon".to_string(), 14_u32),
+            ("zeta".to_string(), 15_u32),
+            ("eta".to_string(), 16_u32),
+            ("theta".to_string(), 17_u32),
+            ("iota".to_string(), 18_u32),
+            ("kappa".to_string(), 19_u32),
+            ("growth".to_string(), 20_u32),
+        ]
+        .into_iter()
+        .collect();
+        let model = WordLevel::builder()
+            .vocab(vocab)
+            .unk_token("[UNK]".to_string())
+            .build()
+            .expect("word level model");
+
+        let mut tokenizer = Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(Whitespace {}));
+        tokenizer.with_post_processor(Some(
+            TemplateProcessing::builder()
+                .try_single("[CLS] $A [SEP]")
+                .expect("single template")
+                .try_pair("[CLS] $A [SEP] $B:1 [SEP]:1")
+                .expect("pair template")
+                .special_tokens(vec![("[CLS]", 2), ("[SEP]", 3)])
+                .build()
+                .expect("template processor"),
+        ));
+        configure_tokenizer_for_uie(&mut tokenizer, max_length).expect("configure tokenizer");
+        tokenizer
     }
 }

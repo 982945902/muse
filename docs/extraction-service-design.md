@@ -697,6 +697,10 @@ HTTP worker 约定：
 - 请求体直接传图片二进制
 - `Content-Type` 透传原始图片 MIME
 - 可选请求头 `X-File-Name`
+- 请求头 `X-Ocr-Request-Id`
+- 可选请求头 `X-Ocr-Source-Type`
+- 可选请求头 `X-Ocr-Page-No-Hint`
+- 可选请求头 `X-Ocr-Meta-*`，用于透传 `sdk_version / protocol_version / pdf_ocr_input` 等上下文
 - 可选 `Authorization: Bearer <token>`
 
 响应示例：
@@ -705,17 +709,38 @@ HTTP worker 约定：
 {
   "provider": "rapidocr-worker",
   "model": "rapidocr-onnx",
-  "lines": [
-    {"text": "岗位类型：图像策略", "confidence": 0.98},
-    {"text": "人设要点：边缘预处理", "confidence": 0.93}
+  "request_id": "ocr-req-123",
+  "timing_ms": 58,
+  "warnings": ["page rotated by OCR classifier"],
+  "pages": [
+    {
+      "page_no": 1,
+      "width": 1242.0,
+      "height": 1660.0,
+      "rotation_degrees": 180.0,
+      "blocks": [
+        {
+          "block_id": "ocr-http-b1",
+          "bbox": {"x1": 10.0, "y1": 20.0, "x2": 160.0, "y2": 84.0},
+          "confidence": 0.96,
+          "lines": [
+            {"text": "岗位类型：图像策略", "confidence": 0.98},
+            {"text": "人设要点：边缘预处理", "confidence": 0.93}
+          ]
+        }
+      ]
+    }
   ]
 }
 ```
 
 主服务接到响应后：
 
-- 合并 `lines` 生成 `plain_text`
+- 优先把 `pages[].blocks[].lines[]` 展平为统一 `OcrOutput`；老的平铺 `blocks/lines` 响应仍继续兼容。
+- 合并 OCR blocks/lines 生成 `plain_text`
 - 将 `provider/model` 回写到 `DocumentIR.metadata.extra`
+- 若 worker 返回 `request_id / timing_ms / warnings`，主服务会继续透传到 `DocumentIR.metadata.extra` 与 SSE 事件，便于排障。
+- 会把 `source_type / page_no_hint / metadata` 等请求上下文以 header 透传给 worker，便于外部 OCR 服务做日志、追踪和多页路由。
 - 记录 `ocr_transport=http-ocr-worker`，用于区分 transport 和真实 OCR 引擎
 
 #### Provider B：本地内置 ONNX / C++ OCR Provider
@@ -1151,7 +1176,7 @@ event: page.parsed
 data: {"sequence":3,"event_type":"page.parsed","task_id":"task_123","created_at_ms":1710000000500,"payload":{"page_no":1,"width":1242.0,"height":1660.0,"block_count":12,"text_chars":236}}
 
 event: page.ocr_done
-data: {"sequence":4,"event_type":"page.ocr_done","task_id":"task_123","created_at_ms":1710000000800,"payload":{"page_no":1,"width":1242.0,"height":1660.0,"rotation_degrees":0.0,"ocr_block_count":12,"ocr_line_count":18,"ocr_provider":"local-onnx-ocr","ocr_model":"det=...","ocr_transport":"inproc","ocr_blocks_preview":[{"block_id":"ocr-p1-b1","text":"岗位类型：图像策略","text_chars":8,"bbox":{"x1":10.0,"y1":20.0,"x2":110.0,"y2":44.0},"confidence":0.98}],"pdf_ocr_input":"page_rasters","pdf_raster_provider":"pdftoppm"}}
+data: {"sequence":4,"event_type":"page.ocr_done","task_id":"task_123","created_at_ms":1710000000800,"payload":{"page_no":1,"width":1242.0,"height":1660.0,"rotation_degrees":0.0,"ocr_block_count":12,"ocr_line_count":18,"ocr_provider":"local-onnx-ocr","ocr_model":"det=...","ocr_transport":"inproc","ocr_request_id":"ocr-req-123","ocr_timing_ms":58,"ocr_warnings":["page rotated by OCR classifier"],"ocr_blocks_preview":[{"block_id":"ocr-p1-b1","text":"岗位类型：图像策略","text_chars":8,"bbox":{"x1":10.0,"y1":20.0,"x2":110.0,"y2":44.0},"confidence":0.98}],"pdf_ocr_input":"page_rasters","pdf_raster_provider":"pdftoppm"}}
 
 event: result.snapshot
 data: {"sequence":5,"event_type":"result.snapshot","task_id":"task_123","created_at_ms":1710000001200,"payload":{"cached":false,"field_count":3,"result":{...}}}
@@ -1166,7 +1191,7 @@ data: {"sequence":6,"event_type":"completed","task_id":"task_123","created_at_ms
 - 已接入 `task.accepted / stage.changed / document.ready / page.parsed / page.ocr_done / block.extracted / result.partial / result.snapshot / cache.hit / completed / failed`。
 - `result.partial` 已支持按页面前缀逐步修订，同一字段可随着后续页面继续更新。
 - `page.parsed` 已可携带页级 `width / height`，便于前端先建立页面坐标系。
-- `page.ocr_done` 已可携带 `width / height / rotation_degrees / ocr_block_count / ocr_line_count` 与 OCR provider 元信息，并附带轻量 `ocr_blocks_preview[]`，便于前端直接做 bbox 叠加和 OCR 调试展示。
+- `page.ocr_done` 已可携带 `width / height / rotation_degrees / ocr_block_count / ocr_line_count` 与 OCR provider 元信息，并附带 `ocr_request_id / ocr_timing_ms / ocr_warnings[] / ocr_blocks_preview[]`，便于前端直接做 bbox 叠加、排障和 OCR 调试展示；当存在页级 OCR 可观测字段时，事件优先使用 `ocr_page_{n}_*`，否则回退到全局 `ocr_*`。
 - 当前实现里，增量型 `result.partial` 与 `block.extracted` 事件也已可携带页级 `width / height / rotation_degrees`，便于字段高亮直接挂回当前页面。
 - `result.partial` 与 `block.extracted` 当前都可额外携带聚合后的 `bbox` 与去重后的 `bboxes[]`，便于前端直接绘制字段高亮框，而不必自己再做 evidence 框合并。
 
@@ -1810,6 +1835,7 @@ ONNX sidecar 约定：
   - 张量输入构造
   - span 输出解码
   - evidence 基础回绑
+  - 输入滑窗 / 多窗去重 的基础回归测试
 - postprocess 字段清洗、evidence 去重、结果归一化。
 - in-memory task store 与带 `hit_count` 的结果缓存。
 - SSE 事件流骨架、`stream_url` 返回、逐页修订的 `result.partial`、`page.ocr_done` 与 `block.extracted` 事件。
@@ -2064,6 +2090,7 @@ sidecar 建议继续保留以下最小字段：
   - `input_ids / attention_mask / token_type_ids` 张量构造
   - `start_probs / end_probs` 输出解码
   - span 到 evidence 的基础回绑
+  - 多窗口重叠场景下的基础去重回归测试
 - 但这一条链路还缺少“真实模型集成验证”这一层，因此当前状态应视为“已实现代码路径，但尚未完成生产验证”，不是最终完成态。
 - schema 需要先线性化成 prompt 或 instruction 文本。
 - 文本切片策略必须支持长文分页或滑窗，不能把全部 `plain_text` 强塞到单次推理。

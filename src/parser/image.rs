@@ -35,6 +35,10 @@ impl Parser for ImageParser {
                 file_name: input.file_name.clone(),
                 mime_type: input.mime_type.clone(),
                 bytes,
+                request_id: None,
+                source_type: Some(input.source_type.clone()),
+                page_no_hint: None,
+                metadata: std::collections::HashMap::new(),
             })
             .await?;
 
@@ -90,6 +94,30 @@ impl Parser for ImageParser {
                         rotation.to_string(),
                     );
                 }
+                if let Some(request_id) = ocr_page.request_id.as_deref() {
+                    document.metadata.extra.insert(
+                        format!("ocr_page_{}_request_id", page.page_no),
+                        request_id.to_string(),
+                    );
+                }
+                if let Some(timing_ms) = ocr_page.timing_ms {
+                    document.metadata.extra.insert(
+                        format!("ocr_page_{}_timing_ms", page.page_no),
+                        timing_ms.to_string(),
+                    );
+                }
+                if !ocr_page.warnings.is_empty() {
+                    document.metadata.extra.insert(
+                        format!("ocr_page_{}_warning_count", page.page_no),
+                        ocr_page.warnings.len().to_string(),
+                    );
+                    for (index, warning) in ocr_page.warnings.iter().enumerate() {
+                        document.metadata.extra.insert(
+                            format!("ocr_page_{}_warning_{}", page.page_no, index + 1),
+                            warning.clone(),
+                        );
+                    }
+                }
             }
             let page_no = page.page_no;
             document.metadata.extra.insert(
@@ -136,6 +164,30 @@ impl Parser for ImageParser {
             "ocr_transport".to_string(),
             self.ocr.transport_name().to_string(),
         );
+        if let Some(request_id) = ocr_output.request_id {
+            document
+                .metadata
+                .extra
+                .insert("ocr_request_id".to_string(), request_id);
+        }
+        if let Some(timing_ms) = ocr_output.timing_ms {
+            document
+                .metadata
+                .extra
+                .insert("ocr_timing_ms".to_string(), timing_ms.to_string());
+        }
+        if !ocr_output.warnings.is_empty() {
+            document.metadata.extra.insert(
+                "ocr_warning_count".to_string(),
+                ocr_output.warnings.len().to_string(),
+            );
+            for (index, warning) in ocr_output.warnings.into_iter().enumerate() {
+                document
+                    .metadata
+                    .extra
+                    .insert(format!("ocr_warning_{}", index + 1), warning);
+            }
+        }
         Ok(document)
     }
 }

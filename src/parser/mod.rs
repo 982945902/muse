@@ -126,6 +126,9 @@ mod tests {
                     width: Some(1242.0),
                     height: Some(1660.0),
                     rotation_degrees: None,
+                    request_id: Some("test-ocr-request-1".to_string()),
+                    timing_ms: Some(27),
+                    warnings: vec!["contrast adjusted".to_string()],
                 }],
                 blocks: vec![
                     crate::ocr::OcrBlock {
@@ -181,6 +184,9 @@ mod tests {
                         confidence: Some(0.8),
                     },
                 ],
+                request_id: Some("test-ocr-request-1".to_string()),
+                timing_ms: Some(27),
+                warnings: vec!["contrast adjusted".to_string()],
                 provider: None,
                 model: Some("test-ocr-model".to_string()),
             })
@@ -226,6 +232,9 @@ mod tests {
                     width: Some(image.width() as f32),
                     height: Some(image.height() as f32),
                     rotation_degrees: None,
+                    request_id: None,
+                    timing_ms: None,
+                    warnings: vec![],
                 }],
                 blocks: vec![],
                 lines: vec![
@@ -254,6 +263,9 @@ mod tests {
                         confidence: Some(0.95),
                     },
                 ],
+                request_id: None,
+                timing_ms: None,
+                warnings: vec![],
                 provider: Some("fixture-image-ocr".to_string()),
                 model: Some("fixture-image-model".to_string()),
             })
@@ -284,6 +296,9 @@ mod tests {
                     width: Some(image.width() as f32),
                     height: Some(image.height() as f32),
                     rotation_degrees: None,
+                    request_id: None,
+                    timing_ms: None,
+                    warnings: vec![],
                 }],
                 blocks: vec![],
                 lines: vec![OcrLine {
@@ -298,6 +313,9 @@ mod tests {
                     }),
                     confidence: Some(0.93),
                 }],
+                request_id: None,
+                timing_ms: None,
+                warnings: vec![],
                 provider: Some("raster-aware-ocr".to_string()),
                 model: Some("png-page-model".to_string()),
             })
@@ -582,9 +600,73 @@ mod tests {
             document
                 .metadata
                 .extra
+                .get("ocr_request_id")
+                .map(String::as_str),
+            Some("test-ocr-request-1")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_timing_ms")
+                .map(String::as_str),
+            Some("27")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_warning_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_warning_1")
+                .map(String::as_str),
+            Some("contrast adjusted")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
                 .get("ocr_page_1_line_count")
                 .map(String::as_str),
             Some("2")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_page_1_request_id")
+                .map(String::as_str),
+            Some("test-ocr-request-1")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_page_1_timing_ms")
+                .map(String::as_str),
+            Some("27")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_page_1_warning_count")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_page_1_warning_1")
+                .map(String::as_str),
+            Some("contrast adjusted")
         );
         assert_eq!(
             document

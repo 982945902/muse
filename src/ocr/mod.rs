@@ -1,4 +1,7 @@
-use crate::{config::Config, domain::BBox};
+use crate::{
+    config::Config,
+    domain::{BBox, SourceType},
+};
 use anyhow::Context;
 use async_trait::async_trait;
 use image::{DynamicImage, GenericImageView, RgbImage, imageops::FilterType};
@@ -11,7 +14,7 @@ use std::os::unix::ffi::OsStrExt;
 #[cfg(all(feature = "onnx-runtime", target_family = "windows"))]
 use std::os::windows::ffi::OsStrExt;
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     marker::PhantomData,
     path::{Path, PathBuf},
     sync::Arc,
@@ -25,11 +28,19 @@ use std::{
     sync::OnceLock,
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OcrRequest {
     pub file_name: Option<String>,
     pub mime_type: Option<String>,
     pub bytes: Vec<u8>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub source_type: Option<SourceType>,
+    #[serde(default)]
+    pub page_no_hint: Option<u32>,
+    #[serde(default)]
+    pub metadata: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -59,6 +70,12 @@ pub struct OcrPage {
     pub width: Option<f32>,
     pub height: Option<f32>,
     pub rotation_degrees: Option<f32>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub timing_ms: Option<u64>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -69,6 +86,12 @@ pub struct OcrOutput {
     pub blocks: Vec<OcrBlock>,
     #[serde(default)]
     pub lines: Vec<OcrLine>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
+    pub timing_ms: Option<u64>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
 }
@@ -87,6 +110,10 @@ struct OcrPreparedInput {
     file_name: Option<String>,
     mime_type: Option<String>,
     original_bytes: Vec<u8>,
+    request_id: Option<String>,
+    source_type: Option<SourceType>,
+    page_no_hint: Option<u32>,
+    metadata: HashMap<String, String>,
     pages: Vec<OcrPreparedPage>,
 }
 
@@ -123,6 +150,12 @@ struct RawOcrOutput {
     blocks: Vec<RawOcrBlock>,
     #[serde(default)]
     lines: Vec<RawOcrLine>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    timing_ms: Option<u64>,
+    #[serde(default)]
+    warnings: Vec<String>,
     provider: Option<String>,
     model: Option<String>,
 }
@@ -133,6 +166,12 @@ struct RawOcrPage {
     width: Option<f32>,
     height: Option<f32>,
     rotation_degrees: Option<f32>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    timing_ms: Option<u64>,
+    #[serde(default)]
+    warnings: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -215,6 +254,10 @@ impl OcrPreprocessor for PassthroughOcrPreprocessor {
             file_name: request.file_name,
             mime_type: request.mime_type.clone(),
             original_bytes: request.bytes.clone(),
+            request_id: request.request_id,
+            source_type: request.source_type,
+            page_no_hint: request.page_no_hint,
+            metadata: request.metadata,
             pages: vec![OcrPreparedPage {
                 page_no: 1,
                 mime_type: request.mime_type,
@@ -261,6 +304,10 @@ impl OcrPreprocessor for LocalOnnxImagePreprocessor {
             file_name: request.file_name,
             mime_type: request.mime_type.clone(),
             original_bytes: request.bytes.clone(),
+            request_id: request.request_id,
+            source_type: request.source_type,
+            page_no_hint: request.page_no_hint,
+            metadata: request.metadata,
             pages: vec![OcrPreparedPage {
                 page_no: 1,
                 mime_type: request.mime_type,
@@ -331,9 +378,17 @@ impl OcrResultAdapter for NormalizeOcrResultAdapter {
         let blocks = normalize_ocr_blocks(raw.blocks, &mut lines);
 
         Ok(OcrOutput {
-            pages: normalize_ocr_pages(raw.pages),
+            pages: normalize_ocr_pages(
+                raw.pages,
+                raw.request_id.clone(),
+                raw.timing_ms,
+                raw.warnings.clone(),
+            ),
             blocks,
             lines,
+            request_id: normalize_optional_string(raw.request_id),
+            timing_ms: raw.timing_ms.filter(|value| *value > 0),
+            warnings: normalize_warnings(raw.warnings),
             provider: raw.provider,
             model: raw.model,
         })
@@ -364,6 +419,9 @@ impl OcrRuntime for PlaceholderOcrRuntime {
                 bbox: None,
                 confidence: Some(0.1),
             }],
+            request_id: None,
+            timing_ms: None,
+            warnings: vec!["placeholder OCR provider used".to_string()],
             provider: Some("placeholder-ocr".to_string()),
             model: None,
         })
@@ -423,8 +481,31 @@ impl OcrRuntime for HttpOcrRuntime {
             .header("content-type", mime_type)
             .body(payload_bytes);
 
+        let request_id = input
+            .request_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        builder = builder.header("x-ocr-request-id", request_id);
+
         if let Some(file_name) = input.file_name.as_deref() {
             builder = builder.header("x-file-name", file_name);
+        }
+
+        if let Some(source_type) = input.source_type.as_ref() {
+            builder = builder.header("x-ocr-source-type", source_type_header_value(source_type));
+        }
+
+        if let Some(page_no_hint) = input.page_no_hint.filter(|page_no| *page_no > 0) {
+            builder = builder.header("x-ocr-page-no-hint", page_no_hint.to_string());
+        }
+
+        for (key, value) in &input.metadata {
+            if value.trim().is_empty() {
+                continue;
+            }
+            if let Some(suffix) = metadata_header_suffix(key) {
+                builder = builder.header(format!("x-ocr-meta-{suffix}"), value);
+            }
         }
 
         if let Some(token) = self.auth_token.as_deref() {
@@ -457,17 +538,57 @@ impl OcrRuntime for HttpOcrRuntime {
             )
         })?;
 
-        Ok(RawOcrOutput {
-            pages: if payload.pages.is_empty() {
-                raw_pages_from_prepared_input(&input)
+        Ok(payload.into_raw_output(&input))
+    }
+}
+
+fn source_type_header_value(source_type: &SourceType) -> &'static str {
+    match source_type {
+        SourceType::Text => "text",
+        SourceType::Image => "image",
+        SourceType::Pdf => "pdf",
+        SourceType::Docx => "docx",
+        SourceType::Html => "html",
+        SourceType::Markdown => "markdown",
+        SourceType::Url => "url",
+        SourceType::Unknown => "unknown",
+    }
+}
+
+fn metadata_header_suffix(key: &str) -> Option<String> {
+    let mut normalized = String::new();
+    let mut previous_was_dash = false;
+
+    for ch in key.chars() {
+        let mapped = match ch {
+            'a'..='z' | '0'..='9' => Some(ch),
+            'A'..='Z' => Some(ch.to_ascii_lowercase()),
+            '_' | '-' | '.' | ' ' | '/' => Some('-'),
+            _ => None,
+        };
+
+        if let Some(mapped) = mapped {
+            if mapped == '-' {
+                if normalized.is_empty() || previous_was_dash {
+                    continue;
+                }
+                previous_was_dash = true;
+                normalized.push(mapped);
             } else {
-                payload.pages
-            },
-            blocks: payload.blocks,
-            lines: payload.lines,
-            provider: payload.provider,
-            model: payload.model,
-        })
+                previous_was_dash = false;
+                normalized.push(mapped);
+            }
+        }
+    }
+
+    while normalized.ends_with('-') {
+        normalized.pop();
+    }
+
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
     }
 }
 
@@ -786,6 +907,9 @@ impl OcrRuntime for LocalOnnxOcrRuntime {
                 height: page.height,
                 rotation_degrees: aggregate_page_rotation_degrees(&classification)
                     .or(page.rotation_degrees),
+                request_id: None,
+                timing_ms: None,
+                warnings: vec![],
             });
         }
 
@@ -793,6 +917,9 @@ impl OcrRuntime for LocalOnnxOcrRuntime {
             pages,
             blocks: vec![],
             lines,
+            request_id: None,
+            timing_ms: None,
+            warnings: vec![],
             provider: Some("local-onnx-ocr".to_string()),
             model: Some(self.model_summary.clone()),
         })
@@ -814,11 +941,19 @@ fn raw_pages_from_prepared_input(input: &OcrPreparedInput) -> Vec<RawOcrPage> {
             width: page.width,
             height: page.height,
             rotation_degrees: page.rotation_degrees,
+            request_id: None,
+            timing_ms: None,
+            warnings: vec![],
         })
         .collect()
 }
 
-fn normalize_ocr_pages(pages: Vec<RawOcrPage>) -> Vec<OcrPage> {
+fn normalize_ocr_pages(
+    pages: Vec<RawOcrPage>,
+    fallback_request_id: Option<String>,
+    fallback_timing_ms: Option<u64>,
+    fallback_warnings: Vec<String>,
+) -> Vec<OcrPage> {
     let mut pages = pages
         .into_iter()
         .filter(|page| page.page_no > 0)
@@ -827,8 +962,24 @@ fn normalize_ocr_pages(pages: Vec<RawOcrPage>) -> Vec<OcrPage> {
             width: page.width.filter(|value| *value > 0.0),
             height: page.height.filter(|value| *value > 0.0),
             rotation_degrees: page.rotation_degrees,
+            request_id: normalize_optional_string(page.request_id),
+            timing_ms: page.timing_ms.filter(|value| *value > 0),
+            warnings: normalize_warnings(page.warnings),
         })
         .collect::<Vec<_>>();
+    if pages.len() == 1 {
+        if let Some(page) = pages.first_mut() {
+            if page.request_id.is_none() {
+                page.request_id = normalize_optional_string(fallback_request_id);
+            }
+            if page.timing_ms.is_none() {
+                page.timing_ms = fallback_timing_ms.filter(|value| *value > 0);
+            }
+            if page.warnings.is_empty() {
+                page.warnings = normalize_warnings(fallback_warnings);
+            }
+        }
+    }
     pages.sort_by_key(|page| page.page_no);
     pages.dedup_by_key(|page| page.page_no);
     pages
@@ -932,6 +1083,33 @@ fn synthesize_ocr_block_id(page_no: Option<u32>, index: usize) -> String {
         Some(page_no) => format!("ocr-p{page_no}-b{}", index + 1),
         None => format!("ocr-b{}", index + 1),
     }
+}
+
+fn normalize_optional_string(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn normalize_warnings(warnings: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+
+    for warning in warnings {
+        let trimmed = warning.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !normalized.iter().any(|existing| existing == trimmed) {
+            normalized.push(trimmed.to_string());
+        }
+    }
+
+    normalized
 }
 
 fn aggregate_page_rotation_degrees(classification: &OcrClassificationRun) -> Option<f32> {
@@ -2906,13 +3084,148 @@ impl LocalOcrBackend for LocalOnnxRuntimeBackend {
 #[derive(Debug, Deserialize)]
 struct WorkerOcrResponse {
     #[serde(default)]
-    pages: Vec<RawOcrPage>,
+    pages: Vec<WorkerOcrPage>,
     #[serde(default)]
     blocks: Vec<RawOcrBlock>,
     #[serde(default)]
     lines: Vec<RawOcrLine>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    timing_ms: Option<u64>,
+    #[serde(default)]
+    warnings: Vec<String>,
     provider: Option<String>,
     model: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerOcrPage {
+    page_no: u32,
+    width: Option<f32>,
+    height: Option<f32>,
+    rotation_degrees: Option<f32>,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    timing_ms: Option<u64>,
+    #[serde(default)]
+    warnings: Vec<String>,
+    #[serde(default)]
+    blocks: Vec<WorkerOcrBlock>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerOcrBlock {
+    block_id: Option<String>,
+    #[serde(default)]
+    text: String,
+    bbox: Option<BBox>,
+    confidence: Option<f32>,
+    line_count: Option<u32>,
+    #[serde(default)]
+    lines: Vec<WorkerOcrLine>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerOcrLine {
+    block_id: Option<String>,
+    text: String,
+    page_no: Option<u32>,
+    bbox: Option<BBox>,
+    confidence: Option<f32>,
+}
+
+impl WorkerOcrResponse {
+    fn into_raw_output(self, input: &OcrPreparedInput) -> RawOcrOutput {
+        let (nested_pages, nested_blocks, nested_lines) = flatten_worker_pages(self.pages);
+
+        RawOcrOutput {
+            pages: if nested_pages.is_empty() {
+                raw_pages_from_prepared_input(input)
+            } else {
+                nested_pages
+            },
+            blocks: if self.blocks.is_empty() {
+                nested_blocks
+            } else {
+                self.blocks
+            },
+            lines: if self.lines.is_empty() {
+                nested_lines
+            } else {
+                self.lines
+            },
+            request_id: self.request_id.or_else(|| input.request_id.clone()),
+            timing_ms: self.timing_ms,
+            warnings: self.warnings,
+            provider: self.provider,
+            model: self.model,
+        }
+    }
+}
+
+fn flatten_worker_pages(
+    pages: Vec<WorkerOcrPage>,
+) -> (Vec<RawOcrPage>, Vec<RawOcrBlock>, Vec<RawOcrLine>) {
+    let mut raw_pages = Vec::new();
+    let mut raw_blocks = Vec::new();
+    let mut raw_lines = Vec::new();
+
+    for page in pages {
+        let page_no = page.page_no.max(1);
+        raw_pages.push(RawOcrPage {
+            page_no,
+            width: page.width,
+            height: page.height,
+            rotation_degrees: page.rotation_degrees,
+            request_id: page.request_id,
+            timing_ms: page.timing_ms,
+            warnings: page.warnings,
+        });
+
+        for (block_index, block) in page.blocks.into_iter().enumerate() {
+            let block_id = normalize_ocr_block_id(block.block_id)
+                .unwrap_or_else(|| synthesize_ocr_block_id(Some(page_no), block_index));
+            let line_count = if block.lines.is_empty() {
+                block.line_count
+            } else {
+                block.line_count.or(Some(block.lines.len() as u32))
+            };
+            let block_text = if block.text.trim().is_empty() {
+                block
+                    .lines
+                    .iter()
+                    .map(|line| line.text.trim())
+                    .filter(|line| !line.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                block.text
+            };
+
+            raw_blocks.push(RawOcrBlock {
+                block_id: Some(block_id.clone()),
+                text: block_text,
+                page_no: Some(page_no),
+                bbox: block.bbox.clone(),
+                confidence: block.confidence,
+                line_count,
+            });
+
+            raw_lines.extend(block.lines.into_iter().map(|line| RawOcrLine {
+                block_id: Some(
+                    normalize_ocr_block_id(line.block_id).unwrap_or_else(|| block_id.clone()),
+                ),
+                text: line.text,
+                page_no: Some(line.page_no.unwrap_or(page_no).max(1)),
+                bbox: line.bbox,
+                confidence: line.confidence,
+            }));
+        }
+    }
+
+    (raw_pages, raw_blocks, raw_lines)
 }
 
 #[cfg(test)]
@@ -2929,7 +3242,7 @@ mod tests {
     use image::{ColorType, ImageEncoder, codecs::png::PngEncoder};
     use serde::Deserialize;
     use serde_json::json;
-    use std::{fs, sync::Arc};
+    use std::{collections::BTreeMap, fs, sync::Arc};
     use tokio::{net::TcpListener, sync::Mutex};
 
     #[derive(Debug, Deserialize)]
@@ -2975,6 +3288,18 @@ mod tests {
         output: OcrOutput,
     }
 
+    #[derive(Clone, Debug, Default)]
+    struct ObservedHttpOcrRequest {
+        content_type: Option<String>,
+        file_name: Option<String>,
+        authorization: Option<String>,
+        request_id: Option<String>,
+        source_type: Option<String>,
+        page_no_hint: Option<String>,
+        metadata_headers: BTreeMap<String, String>,
+        body: Vec<u8>,
+    }
+
     #[async_trait]
     impl OcrProvider for AlwaysFailOcrProvider {
         fn name(&self) -> &'static str {
@@ -3012,6 +3337,7 @@ mod tests {
                 file_name: Some("sample.png".to_string()),
                 mime_type: Some("image/png".to_string()),
                 bytes: b"image-bytes".to_vec(),
+                ..Default::default()
             })
             .expect("prepared input");
 
@@ -3039,6 +3365,9 @@ mod tests {
                         bbox: None,
                         confidence: Some(0.77),
                     }],
+                    request_id: None,
+                    timing_ms: None,
+                    warnings: vec![],
                     provider: Some("secondary-ocr".to_string()),
                     model: Some("fallback-model".to_string()),
                 },
@@ -3050,6 +3379,7 @@ mod tests {
                 file_name: Some("sample.png".to_string()),
                 mime_type: Some("image/png".to_string()),
                 bytes: b"fake".to_vec(),
+                ..Default::default()
             })
             .await
             .expect("fallback should succeed");
@@ -3070,6 +3400,7 @@ mod tests {
                 file_name: Some("sample.png".to_string()),
                 mime_type: Some("image/png".to_string()),
                 bytes: png,
+                ..Default::default()
             })
             .expect("prepared input");
 
@@ -3094,6 +3425,7 @@ mod tests {
                 file_name: Some("large.png".to_string()),
                 mime_type: Some("image/png".to_string()),
                 bytes: png,
+                ..Default::default()
             })
             .expect("prepared input");
 
@@ -3112,6 +3444,7 @@ mod tests {
                 file_name: Some("broken.png".to_string()),
                 mime_type: Some("image/png".to_string()),
                 bytes: b"not-an-image".to_vec(),
+                ..Default::default()
             })
             .expect_err("invalid image bytes should fail");
 
@@ -3428,6 +3761,9 @@ mod tests {
                     width: Some(0.0),
                     height: Some(100.0),
                     rotation_degrees: None,
+                    request_id: None,
+                    timing_ms: None,
+                    warnings: vec![],
                 }],
                 blocks: vec![],
                 lines: vec![
@@ -3448,6 +3784,9 @@ mod tests {
                 ],
                 provider: Some("worker".to_string()),
                 model: Some("model".to_string()),
+                request_id: Some("req-normalize-1".to_string()),
+                timing_ms: Some(42),
+                warnings: vec!["  low contrast  ".to_string(), "".to_string()],
             })
             .expect("normalized output");
 
@@ -3459,6 +3798,9 @@ mod tests {
         assert_eq!(output.lines[0].block_id.as_deref(), Some("ocr-b1"));
         assert_eq!(output.lines[0].text, "岗位类型：图像策略");
         assert_eq!(output.lines[0].page_no, None);
+        assert_eq!(output.request_id.as_deref(), Some("req-normalize-1"));
+        assert_eq!(output.timing_ms, Some(42));
+        assert_eq!(output.warnings, vec!["low contrast".to_string()]);
         assert_eq!(output.provider.as_deref(), Some("worker"));
     }
 
@@ -3506,6 +3848,9 @@ mod tests {
                         confidence: Some(0.89),
                     },
                 ],
+                request_id: None,
+                timing_ms: None,
+                warnings: vec![],
                 provider: Some("worker".to_string()),
                 model: Some("structured".to_string()),
             })
@@ -3523,6 +3868,141 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalize_adapter_falls_back_to_global_observability_for_single_page() {
+        let output = NormalizeOcrResultAdapter
+            .adapt(RawOcrOutput {
+                pages: vec![RawOcrPage {
+                    page_no: 1,
+                    width: Some(100.0),
+                    height: Some(200.0),
+                    rotation_degrees: None,
+                    request_id: None,
+                    timing_ms: None,
+                    warnings: vec![],
+                }],
+                blocks: vec![],
+                lines: vec![RawOcrLine {
+                    block_id: None,
+                    text: "岗位类型：单页回填".to_string(),
+                    page_no: Some(1),
+                    bbox: None,
+                    confidence: Some(0.9),
+                }],
+                request_id: Some("global-req-1".to_string()),
+                timing_ms: Some(18),
+                warnings: vec!["global warning".to_string()],
+                provider: Some("worker".to_string()),
+                model: Some("model".to_string()),
+            })
+            .expect("normalized output");
+
+        assert_eq!(output.pages.len(), 1);
+        assert_eq!(output.pages[0].request_id.as_deref(), Some("global-req-1"));
+        assert_eq!(output.pages[0].timing_ms, Some(18));
+        assert_eq!(output.pages[0].warnings, vec!["global warning".to_string()]);
+    }
+
+    #[test]
+    fn worker_nested_page_contract_flattens_into_raw_output() {
+        let output = WorkerOcrResponse {
+            pages: vec![WorkerOcrPage {
+                page_no: 1,
+                width: Some(1242.0),
+                height: Some(1660.0),
+                rotation_degrees: Some(90.0),
+                request_id: Some("nested-page-req-1".to_string()),
+                timing_ms: Some(33),
+                warnings: vec!["page-specific warning".to_string()],
+                blocks: vec![WorkerOcrBlock {
+                    block_id: Some("nested-b1".to_string()),
+                    text: String::new(),
+                    bbox: Some(BBox {
+                        x1: 10.0,
+                        y1: 20.0,
+                        x2: 120.0,
+                        y2: 84.0,
+                    }),
+                    confidence: Some(0.95),
+                    line_count: None,
+                    lines: vec![
+                        WorkerOcrLine {
+                            block_id: None,
+                            text: "岗位类型：图像策略".to_string(),
+                            page_no: None,
+                            bbox: Some(BBox {
+                                x1: 10.0,
+                                y1: 20.0,
+                                x2: 120.0,
+                                y2: 48.0,
+                            }),
+                            confidence: Some(0.97),
+                        },
+                        WorkerOcrLine {
+                            block_id: None,
+                            text: "人设要点：边缘预处理".to_string(),
+                            page_no: None,
+                            bbox: Some(BBox {
+                                x1: 10.0,
+                                y1: 56.0,
+                                x2: 120.0,
+                                y2: 84.0,
+                            }),
+                            confidence: Some(0.93),
+                        },
+                    ],
+                }],
+            }],
+            blocks: vec![],
+            lines: vec![],
+            request_id: Some("nested-worker-req-1".to_string()),
+            timing_ms: Some(64),
+            warnings: vec!["nested layout".to_string()],
+            provider: Some("nested-worker".to_string()),
+            model: Some("nested-model".to_string()),
+        }
+        .into_raw_output(&OcrPreparedInput {
+            file_name: Some("sample.png".to_string()),
+            mime_type: Some("image/png".to_string()),
+            original_bytes: vec![1, 2, 3],
+            request_id: None,
+            source_type: Some(SourceType::Image),
+            page_no_hint: None,
+            metadata: HashMap::new(),
+            pages: vec![],
+        });
+
+        assert_eq!(output.pages.len(), 1);
+        assert_eq!(output.pages[0].rotation_degrees, Some(90.0));
+        assert_eq!(
+            output.pages[0].request_id.as_deref(),
+            Some("nested-page-req-1")
+        );
+        assert_eq!(output.pages[0].timing_ms, Some(33));
+        assert_eq!(
+            output.pages[0].warnings,
+            vec!["page-specific warning".to_string()]
+        );
+        assert_eq!(output.request_id.as_deref(), Some("nested-worker-req-1"));
+        assert_eq!(output.timing_ms, Some(64));
+        assert_eq!(output.warnings, vec!["nested layout".to_string()]);
+        assert_eq!(output.blocks.len(), 1);
+        assert_eq!(output.blocks[0].block_id.as_deref(), Some("nested-b1"));
+        assert_eq!(output.blocks[0].line_count, Some(2));
+        assert_eq!(
+            output.blocks[0].text,
+            "岗位类型：图像策略\n人设要点：边缘预处理"
+        );
+        assert_eq!(output.lines.len(), 2);
+        assert!(
+            output
+                .lines
+                .iter()
+                .all(|line| line.block_id.as_deref() == Some("nested-b1"))
+        );
+        assert!(output.lines.iter().all(|line| line.page_no == Some(1)));
+    }
+
     #[tokio::test]
     async fn placeholder_provider_returns_informative_text() {
         let provider = PlaceholderOcrProvider::default();
@@ -3531,6 +4011,7 @@ mod tests {
                 file_name: Some("sample.png".to_string()),
                 mime_type: Some("image/png".to_string()),
                 bytes: b"image-bytes".to_vec(),
+                ..Default::default()
             })
             .await
             .expect("placeholder OCR should succeed");
@@ -3663,6 +4144,10 @@ mod tests {
                 file_name: Some("sample.png".to_string()),
                 mime_type: Some("image/png".to_string()),
                 original_bytes: vec![1, 2, 3],
+                request_id: None,
+                source_type: Some(SourceType::Image),
+                page_no_hint: None,
+                metadata: HashMap::new(),
                 pages: vec![OcrPreparedPage {
                     page_no: 1,
                     mime_type: Some("image/png".to_string()),
@@ -3777,18 +4262,39 @@ mod tests {
                 file_name: Some("sample.png".to_string()),
                 mime_type: Some("image/png".to_string()),
                 bytes: b"fake-image".to_vec(),
+                request_id: Some("req-http-test-1".to_string()),
+                source_type: Some(SourceType::Image),
+                page_no_hint: Some(1),
+                metadata: HashMap::from([
+                    ("sdk_version".to_string(), "0.1.0".to_string()),
+                    ("protocol_version".to_string(), "1".to_string()),
+                ]),
             })
             .await
             .expect("HTTP OCR should succeed");
 
         let observed = seen.lock().await.clone().expect("captured request");
-        assert_eq!(observed.0.as_deref(), Some("image/png"));
-        assert_eq!(observed.1.as_deref(), Some("sample.png"));
-        assert_eq!(observed.2.as_deref(), Some("Bearer top-secret"));
-        assert_eq!(observed.3, b"fake-image".to_vec());
+        assert_eq!(observed.content_type.as_deref(), Some("image/png"));
+        assert_eq!(observed.file_name.as_deref(), Some("sample.png"));
+        assert_eq!(observed.authorization.as_deref(), Some("Bearer top-secret"));
+        assert_eq!(observed.request_id.as_deref(), Some("req-http-test-1"));
+        assert_eq!(observed.source_type.as_deref(), Some("image"));
+        assert_eq!(observed.page_no_hint.as_deref(), Some("1"));
+        assert_eq!(
+            observed.metadata_headers.get("x-ocr-meta-sdk-version"),
+            Some(&"0.1.0".to_string())
+        );
+        assert_eq!(
+            observed.metadata_headers.get("x-ocr-meta-protocol-version"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(observed.body, b"fake-image".to_vec());
 
         assert_eq!(output.provider.as_deref(), Some("rapidocr-worker"));
         assert_eq!(output.model.as_deref(), Some("rapidocr-onnx"));
+        assert_eq!(output.request_id.as_deref(), Some("worker-http-req-1"));
+        assert_eq!(output.timing_ms, Some(37));
+        assert_eq!(output.warnings, vec!["low contrast".to_string()]);
         assert_eq!(output.blocks.len(), 2);
         assert_eq!(output.blocks[0].block_id, "ocr-http-b1");
         assert_eq!(output.blocks[0].line_count, Some(1));
@@ -3798,6 +4304,47 @@ mod tests {
         assert_eq!(output.lines[0].page_no, Some(1));
         assert!(output.lines[0].bbox.is_some());
         assert_eq!(output.lines[1].block_id.as_deref(), Some("ocr-http-b2"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn http_provider_decodes_nested_page_contract() {
+        let app = Router::new().route("/v1/ocr", post(test_ocr_nested_handler));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("listener");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("server");
+        });
+
+        let provider = HttpOcrProvider::new(
+            format!("http://{addr}/v1/ocr"),
+            Duration::from_secs(2),
+            None,
+        )
+        .expect("provider");
+        let output = provider
+            .recognize(OcrRequest {
+                file_name: Some("sample.png".to_string()),
+                mime_type: Some("image/png".to_string()),
+                bytes: b"fake-image".to_vec(),
+                ..Default::default()
+            })
+            .await
+            .expect("HTTP OCR should succeed");
+
+        assert_eq!(output.pages.len(), 1);
+        assert_eq!(output.pages[0].rotation_degrees, Some(180.0));
+        assert_eq!(output.blocks.len(), 1);
+        assert_eq!(output.blocks[0].block_id, "ocr-http-nested-b1");
+        assert_eq!(output.blocks[0].line_count, Some(2));
+        assert_eq!(output.lines.len(), 2);
+        assert!(
+            output
+                .lines
+                .iter()
+                .all(|line| line.block_id.as_deref() == Some("ocr-http-nested-b1"))
+        );
 
         server.abort();
     }
@@ -3825,6 +4372,7 @@ mod tests {
                 file_name: None,
                 mime_type: None,
                 bytes: b"fake-image".to_vec(),
+                ..Default::default()
             })
             .await
             .expect_err("HTTP OCR should fail");
@@ -3835,31 +4383,55 @@ mod tests {
     }
 
     async fn test_ocr_handler(
-        State(seen): State<
-            Arc<Mutex<Option<(Option<String>, Option<String>, Option<String>, Vec<u8>)>>>,
-        >,
+        State(seen): State<Arc<Mutex<Option<ObservedHttpOcrRequest>>>>,
         headers: HeaderMap,
         body: Bytes,
     ) -> Json<serde_json::Value> {
-        *seen.lock().await = Some((
-            headers
+        let metadata_headers = headers
+            .iter()
+            .filter_map(|(name, value)| {
+                let name = name.as_str();
+                if !name.starts_with("x-ocr-meta-") {
+                    return None;
+                }
+                Some((name.to_string(), value.to_str().ok()?.to_string()))
+            })
+            .collect::<BTreeMap<_, _>>();
+        *seen.lock().await = Some(ObservedHttpOcrRequest {
+            content_type: headers
                 .get("content-type")
                 .and_then(|value| value.to_str().ok())
                 .map(ToString::to_string),
-            headers
+            file_name: headers
                 .get("x-file-name")
                 .and_then(|value| value.to_str().ok())
                 .map(ToString::to_string),
-            headers
+            authorization: headers
                 .get("authorization")
                 .and_then(|value| value.to_str().ok())
                 .map(ToString::to_string),
-            body.to_vec(),
-        ));
+            request_id: headers
+                .get("x-ocr-request-id")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            source_type: headers
+                .get("x-ocr-source-type")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            page_no_hint: headers
+                .get("x-ocr-page-no-hint")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            metadata_headers,
+            body: body.to_vec(),
+        });
 
         Json(json!({
             "provider": "rapidocr-worker",
             "model": "rapidocr-onnx",
+            "request_id": "worker-http-req-1",
+            "timing_ms": 37,
+            "warnings": ["low contrast"],
             "blocks": [
                 {"block_id": "ocr-http-b1", "text": "岗位类型：图像策略", "page_no": 1, "bbox": {"x1": 10.0, "y1": 20.0, "x2": 110.0, "y2": 44.0}, "confidence": 0.98, "line_count": 1},
                 {"block_id": "ocr-http-b2", "text": "人设要点：边缘预处理", "page_no": 1, "bbox": {"x1": 12.0, "y1": 60.0, "x2": 160.0, "y2": 84.0}, "confidence": 0.93, "line_count": 1}
@@ -3868,6 +4440,32 @@ mod tests {
                 {"block_id": "ocr-http-b1", "text": "岗位类型：图像策略", "page_no": 1, "bbox": {"x1": 10.0, "y1": 20.0, "x2": 110.0, "y2": 44.0}, "confidence": 0.98},
                 {"text": "  ", "confidence": 0.2},
                 {"block_id": "ocr-http-b2", "text": "人设要点：边缘预处理", "page_no": 1, "bbox": {"x1": 12.0, "y1": 60.0, "x2": 160.0, "y2": 84.0}, "confidence": 0.93}
+            ]
+        }))
+    }
+
+    async fn test_ocr_nested_handler() -> Json<serde_json::Value> {
+        Json(json!({
+            "provider": "nested-worker",
+            "model": "nested-ocr-onnx",
+            "pages": [
+                {
+                    "page_no": 1,
+                    "width": 1242.0,
+                    "height": 1660.0,
+                    "rotation_degrees": 180.0,
+                    "blocks": [
+                        {
+                            "block_id": "ocr-http-nested-b1",
+                            "bbox": {"x1": 10.0, "y1": 20.0, "x2": 160.0, "y2": 84.0},
+                            "confidence": 0.96,
+                            "lines": [
+                                {"text": "岗位类型：图像策略", "bbox": {"x1": 10.0, "y1": 20.0, "x2": 160.0, "y2": 48.0}, "confidence": 0.98},
+                                {"text": "人设要点：边缘预处理", "bbox": {"x1": 10.0, "y1": 56.0, "x2": 160.0, "y2": 84.0}, "confidence": 0.94}
+                            ]
+                        }
+                    ]
+                }
             ]
         }))
     }
