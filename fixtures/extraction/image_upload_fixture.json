@@ -1,0 +1,26 @@
+{
+  "schema": {
+    "name": "image-demo",
+    "version": "1",
+    "fields": [
+      {
+        "key": "岗位类型",
+        "field_type": "string",
+        "required": false,
+        "multiple": false,
+        "children": [],
+        "hints": []
+      }
+    ]
+  },
+  "expected_raw_text": "岗位类型：图片运营",
+  "expected_field_key": "岗位类型",
+  "expected_field_value": "图片运营",
+  "expected_evidence_page_nos": [1],
+  "expected_page_ocr_done": {
+    "pdf_ocr_input": null,
+    "pdf_raster_provider": null,
+    "ocr_provider": "raster-aware-ocr",
+    "ocr_transport": "inproc"
+  }
+}

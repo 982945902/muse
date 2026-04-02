@@ -77,6 +77,19 @@ impl EventHub {
             receiver: stream.sender.subscribe(),
         })
     }
+
+    #[cfg(test)]
+    pub async fn task_ids(&self) -> Vec<String> {
+        let mut task_ids = self
+            .streams
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        task_ids.sort();
+        task_ids
+    }
 }
 
 impl TaskEventStream {

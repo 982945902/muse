@@ -1,5 +1,71 @@
 # 统一信息提取服务设计文档
 
+## 0. 一页结论
+
+### 0.1 这是什么
+
+这是一个统一信息提取服务，目标是把图片、PDF、docx、文本、URL 等输入统一转换为 `DocumentIR`，再按 schema 输出结构化结果。
+
+它不是单独的 OCR 服务，也不是单独的模型演示程序，而是一条完整的服务链路：
+
+- 输入接入
+- 标准化
+- 信息抽取
+- 结果后处理
+- 缓存、任务、事件流、结果查询
+
+### 0.2 当前做到哪
+
+当前已经达到：
+
+- 主链路可跑
+- API 可用
+- 同步/异步可用
+- 标准化输入可用
+- SSE 进度流可用
+- heuristic extractor 可用
+- ONNX 字符串 I/O 路线可用
+- tokenized/UIE 路线已有代码路径
+
+当前阶段判断：
+
+- 工程阶段：`Alpha / 可跑的 MVP 服务`
+- 适合：内部验证、小范围接入、围绕真实样本持续打磨
+- 暂不适合：直接作为生产级、多租户、长期稳定运行服务
+
+### 0.3 当前最大缺口
+
+距离“生产可用”最关键的缺口有四个：
+
+1. 本地 OCR 已具备 MVP，但真实模型质量回归、classification 编排和扫描件端到端验证仍未完成。
+2. storage 和 queue 仍是 in-memory，异步任务不具备真正的持久化恢复能力。
+3. tokenized/UIE ONNX 虽然代码路径已实现，但还缺真实模型集成验证。
+4. 缓存治理、租户隔离、可观测性仍未完成。
+
+### 0.4 当前最优先顺序
+
+建议优先级：
+
+1. 本地 `local-onnx` OCR provider 最小闭环
+2. SQLite 持久化 `tasks/results/events/cache`
+3. 字符串 I/O ONNX 真实模型集成测试
+4. tokenized/UIE ONNX 真实模型集成测试
+5. 缓存 TTL 与后台清理
+
+### 0.5 进入 Beta 的最低条件
+
+满足以下条件后，才建议把当前项目从 `Alpha` 认定为 `Beta`：
+
+- 图片链路不再强依赖外部 OCR worker
+- 异步任务在服务重启后可恢复
+- 至少一条 ONNX 模型链路有真实模型集成测试和回归样本
+- 缓存具备 TTL 和基本治理能力
+- 关键阶段具备基础日志、指标和错误排查能力
+
+### 0.6 一句话判断
+
+这不是“还停在原型脚本”的状态了，而是一个已经立住骨架、可以持续工程化推进的提取服务；接下来最重要的不是再发散设计，而是按优先级把 OCR、本地持久化和真实模型验证补齐。
+
 ## 1. 背景
 
 当前已有原型可以对小红书笔记截图执行如下流程：
@@ -235,6 +301,12 @@
 
 - 对图片或扫描页执行 OCR。
 - 输出文本块、坐标、置信度。
+
+设计补充：
+
+- OCR 不应只抽象成“调用哪个 provider”，还应抽象成“前处理 / 运行时 / 结果适配”三层。
+- 原因是 OCR 比 extractor 更容易发生引擎切换、部署方式切换和输出协议差异。
+- 上层 parser 和 `DocumentIR` 应尽量只依赖统一的 `OcrOutput`，不直接感知底层 OCR 引擎细节。
 
 #### Extractor Provider
 
@@ -552,6 +624,43 @@ pub trait OcrProvider {
 }
 ```
 
+但工程上建议进一步拆成三层，而不是把所有逻辑都塞进一个 provider：
+
+1. `Preprocess Layer`
+2. `Runtime Layer`
+3. `Result Adapter Layer`
+
+建议职责：
+
+#### Preprocess Layer
+
+- 图片缩放与归一化。
+- 旋转纠正。
+- PDF 页转图片。
+- 大图切片或页图切分。
+
+#### Runtime Layer
+
+- 真正调用 OCR 引擎。
+- 可以是 `http worker`、本地 ONNX、本地 C++、云 OCR。
+- 负责模型加载、线程数、超时、预热和生命周期。
+
+#### Result Adapter Layer
+
+- 将不同 OCR 引擎输出统一转换为服务内部 `OcrOutput`。
+- 统一字段至少包括：
+  - `lines[].text`
+  - `lines[].confidence`
+  - `lines[].page_no`
+  - `lines[].bbox`
+
+这样做的好处：
+
+- 切换 OCR 引擎时，尽量不影响 parser。
+- HTTP OCR 和本地 OCR 可以复用同一套上层逻辑。
+- `DocumentIR` 和 evidence 链路保持稳定。
+- 后续如果要接 block/line/word 多层级输出，也只需要扩展 adapter 层。
+
 候选实现：
 
 #### Provider A：PaddleOCR C++ Worker
@@ -672,8 +781,10 @@ HTTP worker 约定：
 当前实现：
 
 - 已支持“文本层优先 + OCR fallback”。
-- 当 PDF 文本层为空时，parser 会把原始 PDF 字节交给 OCR provider 兜底。
-- 页级混合路由仍保留为下一阶段能力。
+- 已引入 `CompositePdfProvider` 边界：文本层提取与页图栅格化可分别替换。
+- 默认文本层提取仍使用 `lopdf`。
+- 若配置 `pdftoppm` rasterizer，当 PDF 文本层为空时会先产出 `raster_pages`，再交给 OCR provider 逐页识别。
+- 若未配置 rasterizer，仍保留 `original_pdf_bytes` 兼容兜底路径，但这不应视为扫描 PDF 的最终生产方案。
 
 ### 10.6 信息抽取模型选型
 
@@ -1330,6 +1441,8 @@ SDK 协议治理：
 - 扫描 PDF OCR 链路。
 - 缓存命中链路。
 - HTTP OCR worker 成功响应与错误响应。
+- 扫描 PDF 的 `page_rasters -> OCR -> DocumentIR` 集成链路。
+- `multipart upload -> parser -> OCR -> extractor -> response` 的扫描 PDF API 集成链路。
 
 ### 19.3 回归评测
 
@@ -1451,17 +1564,38 @@ src/
 
 当前实现中的 OCR 配置项：
 
-- `MUSE_OCR_PROVIDER=placeholder|http`
+- `MUSE_OCR_PROVIDER=placeholder|http|local-onnx`
 - `MUSE_OCR_WORKER_URL=http://host:port/v1/ocr`
 - `MUSE_OCR_TIMEOUT_MS=5000`
 - `MUSE_OCR_WORKER_TOKEN=<token>`
-
-后续建议补充的本地 OCR 配置项：
-
-- `MUSE_OCR_PROVIDER=local-onnx`
 - `MUSE_OCR_MODEL_DIR=/path/to/ocr-models`
 - `MUSE_OCR_THREADS=1`
 - `MUSE_OCR_PREWARM=true|false`
+
+当前实现中的 PDF 配置项：
+
+- `MUSE_PDF_RASTER_PROVIDER=none|pdftoppm`
+- `MUSE_PDFTOPPM_BIN=/usr/bin/pdftoppm`
+
+当前实现状态说明：
+
+- 目前完成的是 `Runtime Layer + Result Adapter Layer` 的 MVP 版本。
+- `http` provider 已可视为真实运行时接入。
+- `placeholder` 仅是开发兜底，不应视为生产 OCR。
+- `local-onnx` 已完成启动配置、模型目录发现、图片解码/缩放/CHW 归一化前处理、ONNX Runtime session bootstrap、detector 输入张量构造与 session run、heatmap 连通域解码、recognition patch 裁片准备、recognition tensor 执行、以及可选预热。
+- `local-onnx` 已可完成 `det + rec + CTC decode` 的基础 OCR 推理，但仍缺真实模型回归与稳定性验证。
+- `Preprocess Layer` 目前仍较薄，后续应继续从 parser 中抽离并独立治理。
+- PDF 已支持 `CompositePdfProvider` 组合模式：
+  - 文本层路径：`lopdf`
+  - 栅格化 fallback：可选 `pdftoppm`
+  - 当前默认未强制开启 rasterizer，需要通过配置显式启用
+
+当前 `local-onnx` 目录约定：
+
+- 必需：`det.onnx` 或 `ocr_det.onnx` 或 `text_detection.onnx`
+- 必需：`rec.onnx` 或 `ocr_rec.onnx` 或 `text_recognition.onnx`
+- 必需：`ppocr_keys_v1.txt` 或 `dict.txt` 或 `ocr_keys.txt` 或 `keys.txt` 或 `charset.txt`
+- 可选：`cls.onnx` 或 `ocr_cls.onnx` 或 `text_classification.onnx` 或 `text_direction.onnx`
 
 当前 OCR worker 响应约定补充：
 
@@ -1492,41 +1626,209 @@ ONNX sidecar 约定：
 最终目标不是构建一个“模型演示程序”，而是构建一个“低成本、可扩展、可审计”的统一提取平台。
 
 
-## 23. 待确认问题
+## 23. 当前进度总览
 
-以下问题需要在开工前进一步确认：
+当前阶段判断：
+
+- 方案成熟度：清晰，主链路已经确定。
+- 工程阶段：`Alpha / 可跑的 MVP 服务`。
+- 适合：内部验证、小范围接入、围绕真实样本继续迭代。
+- 暂不适合：直接作为生产级多租户长期运行服务。
+
+### 23.1 已完成
+
+- 服务主链路已经成立：`ingestion -> parser -> extractor -> postprocess -> storage`。
+- 已提供统一 API：同步提取、异步提取、标准化输入提取、任务查询、健康检查、版本接口。
+- 已完成双轨输入：
+  - 原始输入轨道：`image/pdf/docx/text/url`
+  - 标准化输入轨道：`NormalizedDocument`
+- `DocumentIR` 已具备页/块颗粒度，而不是只有一份纯文本：
+  - 图片按 OCR 行生成 block
+  - PDF 按页生成 block
+  - docx 按段落生成 block
+- OCR provider 抽象已经打通：
+  - `placeholder`
+  - `http`
+  - `local-onnx bootstrap`
+- OCR 证据链已经贯通：
+  - `lines[].text / confidence / page_no / bbox`
+  - 这些信息会传到 `DocumentIR.pages[].blocks[]`
+  - 最终 evidence 会保留 `page_no / bbox / source_block_ids`
+- PDF 已支持文本层优先和 OCR fallback。
+- heuristic extractor 已可用，支持：
+  - schema key 与 hints 命中
+  - `string / number / boolean`
+  - object/array 子字段聚合
+  - evidence 回绑
+- ONNX extractor 已具备可运行主链路：
+  - sidecar 契约
+  - session 启动
+  - 字符串 I/O 真推理
+  - JSON 输出解码
+- SSE 流式事件已经成型：
+  - `task.accepted`
+  - `stage.changed`
+  - `document.ready`
+  - `page.parsed`
+  - `page.ocr_done`
+  - `block.extracted`
+  - `result.partial`
+  - `result.snapshot`
+  - `cache.hit`
+  - `completed`
+  - `failed`
+- `result.partial` 已支持按页面前缀修订，而不是只发一次最终字段。
+
+### 23.2 半完成
+
+- OCR 能力目前是“服务契约已完成，但本地真推理未完成”。
+  - `http` provider 是真链路，但依赖外部 OCR worker
+  - `placeholder` 只是开发兜底，不是生产 OCR
+  - `local-onnx` 已完成图片前处理、detector 输入张量构造、session run、候选 bbox 解码、recognition patch 裁片准备、recognition tensor 执行与 CTC decode，但仍缺真实模型回归与稳定性验证
+- ONNX 能力目前是“主链路已打通，但模型通用性还不够完整”。
+  - 字符串 I/O 路线已完成
+  - tokenized/UIE 路线已具备代码路径
+  - 但 tokenized/UIE 仍缺真实模型集成验证，离生产完成态还有距离
+- 异步任务能力目前是“接口可用，但底层还是进程内实现”。
+  - queue 是 in-memory
+  - storage 是 in-memory
+  - 更偏 MVP，不是生产级任务系统
+- 缓存能力目前是“命中和元数据已完成，但治理未完成”。
+  - 已有 `hit_count / created_at_ms / last_accessed_at_ms`
+  - 还没有 TTL、淘汰、租户隔离
+
+### 23.3 未完成
+
+- 本地内置 OCR provider：
+  - `local-paddle`
+  - 或本地 C++/Rust OCR runtime
+- `local-onnx` 的真实 OCR inference 与 bbox/line 结果解码。
+- 持久化 storage：
+  - Postgres / SQLite
+  - 结果表、任务表、缓存索引
+- 生产级 queue：
+  - Redis / NATS / RabbitMQ
+- 页级 OCR 缓存与更细粒度成本路由。
+- 更完整的可观测性：
+  - metrics
+  - tracing
+  - dashboard
+- Webhook / WebSocket / 控制台等交互层能力。
+- 多租户、限流、配额、数据保留策略。
+
+### 23.4 当前最优先下一步
+
+如果按“最快把产品做成可用服务”排序，我建议是：
+
+1. 补齐本地 OCR provider
+2. 落地持久化 storage + queue
+3. 选定一条稳定 ONNX 模型链路并做针对性适配
+4. 增加页级 OCR 缓存和任务超时/重试
+
+原因：
+
+- 没有本地 OCR provider，当前图片能力仍然依赖外部 worker。
+- 没有持久化 storage/queue，异步任务还不具备真正生产可用性。
+- ONNX 虽然已经前进很多，但要先围绕一个明确模型收敛，不然容易陷入适配扩张。
+
+### 23.5 待确认问题
+
+下面这些问题已经不是“能不能开工”的问题，而是“接下来优先级怎么排”的问题：
 
 1. 第一批核心业务场景具体有哪些，字段 schema 是否稳定。
 2. 对时延的要求是在线实时优先，还是批量吞吐优先。
-3. 是否必须完全去除 Python 依赖，还是允许 OCR 作为独立辅助 worker 存在。
-4. 是否需要在第一阶段支持证据框坐标返回。
-5. 是否需要租户级缓存隔离与数据保留策略。
+3. 是否接受 OCR 作为独立 worker 长期存在，还是必须收敛到本地内置 OCR。
+4. 第一阶段是否要把证据框坐标稳定暴露给前端产品层。
+5. 是否需要租户级缓存隔离、结果过期和数据保留策略。
 
 
 ## 24. 已完成
 
+### 24.1 完成快照
+
+- `API / 编排`
+  状态：已完成 MVP
+  说明：同步、异步、标准化输入、任务查询、SSE 事件流都已具备。
+- `Parser / DocumentIR`
+  状态：已完成 MVP
+  说明：原始输入与标准化输入已统一收敛到 `DocumentIR`，且保留页/块颗粒度。
+- `OCR`
+  状态：半完成
+  说明：抽象、HTTP worker 协议、证据链贯通已完成；`local-onnx` 已具备 detector 可运行链路、recognition patch 准备、recognition tensor 执行与基础文本解码，但真实模型验证仍未补齐。
+- `Extractor / Heuristic`
+  状态：已完成 MVP
+  说明：可覆盖当前原型级字段抽取需求，并具备 evidence 回绑。
+- `Extractor / ONNX 字符串 I/O`
+  状态：已完成
+  说明：已具备 sidecar、session、输入构造、运行、JSON 输出解码全链路。
+- `Extractor / ONNX tokenized/UIE`
+  状态：半完成
+  说明：代码路径已实现，但真实模型集成验证和回归基线还未补齐。
+- `Storage / Queue / Cache`
+  状态：半完成
+  说明：MVP 能跑，但目前仍是 in-memory，缺持久化与治理能力。
+- `可观测性 / 生产治理`
+  状态：未完成
+  说明：日志已具备基础信息，但 metrics、tracing、配额、租户治理还未完成。
+
 - Rust 服务骨架、同步/异步接口、任务查询、健康检查、版本接口。
 - `image/pdf/docx/text/url` 原始输入轨道。
 - `NormalizedDocument` 标准化输入轨道与协议校验。
-- 图片 OCR provider 抽象，支持 `placeholder` 与 `http` worker。
-- 已预留后续扩展本地内置 OCR provider 的统一抽象边界。
+- 图片 OCR provider 抽象，现支持 `placeholder`、`http` worker 与 `local-onnx bootstrap`。
+- 本地 OCR 已具备统一抽象边界，以及 `local-onnx` 的目录发现、图片前处理、detector 输入张量构造、候选 bbox 解码、recognition patch 准备、recognition tensor 执行、CTC 文本解码、session 启动与预热能力。
+- OCR 内部已按 `Preprocess / Runtime / Result Adapter` 三层拆出 MVP 结构。
+- OCR metadata 已区分 `ocr_provider` 与 `ocr_transport`，`/version` 也已暴露 transport。
+- 已支持 `MUSE_OCR_FALLBACK_PROVIDER`，可在主 OCR provider 失败时自动回退到备用 provider。
 - PDF 文本层优先与 OCR fallback。
+- 扫描 PDF 已新增 `raster_pages` 契约，parser 会优先对页图逐页 OCR，并在 metadata 中记录 `pdf_ocr_input=page_rasters|original_pdf_bytes`。
+- `/version` 已暴露 `pdf_raster_provider`，扫描 PDF metadata 也可记录 `pdf_raster_provider` 便于排障。
 - `DocumentIR` 页/块颗粒度增强：图片按 OCR 行、PDF 按页、docx 按段落保留结构。
 - heuristic extractor、基础类型转换、object/array 子字段聚合。
 - ONNX Runtime CPU provider 配置入口、sidecar 约定、字符串 I/O 真推理与 JSON 输出解码。
+- tokenized/UIE ONNX 路线的基础代码路径已经具备：
+  - tokenizer 加载
+  - prompt 线性化
+  - 长文滑窗
+  - 张量输入构造
+  - span 输出解码
+  - evidence 基础回绑
 - postprocess 字段清洗、evidence 去重、结果归一化。
 - in-memory task store 与带 `hit_count` 的结果缓存。
 - SSE 事件流骨架、`stream_url` 返回、逐页修订的 `result.partial`、`page.ocr_done` 与 `block.extracted` 事件。
 
 ## 25. TODO
 
+### 25.0 执行看板
+
+- `P0`
+  目标：把服务从“可跑 MVP”推进到“可稳定内测”
+  范围：本地 OCR、持久化、缓存治理、真实 ONNX 集成验证
+- `P1`
+  目标：把服务从“可稳定内测”推进到“可持续扩展”
+  范围：Postgres、多实例任务、Webhook、真实 tokenized/UIE 模型回归
+- `P2`
+  目标：把服务从“可持续扩展”推进到“可平台化运营”
+  范围：WebSocket、控制台、多租户、配额与数据治理
+
 ### 25.1 本地内置 OCR 推理
+
+状态：
+
+- 当前优先级：`P0`
+- 当前风险：高
+- 当前收益：高
 
 目标：
 
 - 在保留 `http` OCR worker 的同时，补齐进程内本地 OCR 推理能力。
 - 让单机部署、离线环境和内网环境不再强依赖外部 OCR 服务。
 - 保持 `OcrProvider -> OcrOutput` 契约稳定，不影响 parser 与上层服务编排。
+
+设计原则补充：
+
+- OCR 的变化面应尽量收敛在 `Preprocess / Runtime / Result Adapter` 三层内部。
+- 不论底层接的是 Paddle、RapidOCR、ONNX 还是云 OCR，上层 parser 都不应感知具体差异。
+- `DocumentIR` 和 evidence 回绑逻辑应继续只依赖统一的 `OcrOutput`。
 
 建议拆成三层：
 
@@ -1545,15 +1847,47 @@ pub struct LocalOnnxOcrProvider {
 建议配置项：
 
 - `MUSE_OCR_PROVIDER=local-onnx`
+- `MUSE_OCR_FALLBACK_PROVIDER=http|placeholder`
 - `MUSE_OCR_MODEL_DIR=/path/to/ocr-models`
 - `MUSE_OCR_THREADS=1`
 - `MUSE_OCR_PREWARM=true|false`
+
+当前已完成：
+
+- `Config` 与 `AppState` 已支持 `local-onnx` provider 选择。
+- 已完成模型目录发现与必需文件校验。
+- 已完成图片解码、限边长缩放与 RGB->CHW 浮点张量前处理。
+- 已完成 detector 的输入张量拼装与单输入 session run。
+- 已完成 detector heatmap 的连通域解码，并可回映射到原图 bbox。
+- 已完成 bbox 到 recognition patch 的基础裁片与缩放准备。
+- 已完成 recognition session 的单 patch 张量执行与输出摘要。
+- 已完成基于 charset sidecar 的 CTC greedy 文本解码主路径。
+- 已完成基础 `OcrLine[]` 结果组装与 bbox/confidence/page_no 回填。
+- 已具备可注入 backend 的 runtime 单测能力，便于脱离真实 ONNX 模型验证拼装链路。
+- 已补充 fixture 驱动的 OCR 回归测试，可覆盖 `det -> rec -> decode -> OcrLine[]` 基础链路。
+- 已完成 ONNX Runtime CPU session bootstrap。
+- 已支持 `prewarm` 阶段对 detection / recognition / classification session 做基础自检。
+- 已完成 `ocr_provider / ocr_transport` 元信息分离，并在 `/version` 与 `DocumentIR.metadata.extra` 中统一暴露。
+- 已支持按配置在主 OCR provider 失败时自动回退到备用 provider。
+- 已为扫描 PDF 补充 `raster_pages` 输入契约与逐页 OCR 聚合逻辑，并有集成测试覆盖多页页号回填。
+- 已补充上传接口级扫描 PDF 集成测试，覆盖 `multipart upload -> parser -> OCR -> extractor -> response` 主链路。
+- 已补充 `CompositePdfProvider` 单测，覆盖“有文本层不栅格化 / 无文本层走 rasterizer”两条路径。
+- 已新增 fixture 驱动的扫描 PDF、图片上传成功回归、图片上传缓存命中回归、同步 OCR 失败回归，以及异步 OCR 失败、异步 PDF raster 失败回归样例，开始建立可扩展的 golden regression 基线。
+- 同步执行失败现在也会落任务失败状态并发布失败事件，便于和异步路径保持一致的排障语义。
+
+当前未完成：
+
+- classification 的真实推理编排。
+- 围绕真实模型样本的识别质量回归与解码稳健性验证。
+- 真实图片或扫描 PDF 的端到端集成回归。
 
 落地要点：
 
 - 如果 OCR 模型拆成检测/方向分类/识别多个 ONNX 文件，要在启动时一次性校验齐全。
 - 统一输出 `lines[].text / confidence / page_no / bbox`，避免和 `http` provider 走两套协议。
 - 在 `DocumentIR.metadata.extra` 中记录 `ocr_provider / ocr_model / ocr_transport=inproc`。
+- 扫描 PDF 的正确 OCR 输入应是逐页 raster image，而不是直接把整份 PDF bytes 传给 image OCR provider。
+- `raster_pages` 契约需要校验：`page_no >= 1`、页号不重复、页图 bytes 非空。
 - 对大图和扫描 PDF 需要限制单页最大分辨率，避免内存峰值失控。
 - 本地 provider 失败时，允许按配置回退 `http` worker 或 `placeholder`。
 
@@ -1563,12 +1897,40 @@ pub struct LocalOnnxOcrProvider {
 - `/version` 能暴露当前 OCR provider 名称与 transport。
 - 至少有一组真实图片或扫描 PDF 集成测试覆盖“输入 -> OCR -> DocumentIR -> extractor”链路。
 
+下一动作建议：
+
+1. 先围绕真实模型补识别质量回归和解码稳健性验证。
+2. 再评估 classification 路径是否真的还需要保留。
+3. 最后补真实图片集成测试，而不是先追求多 provider。
+
 ### 25.2 ONNX 运行时增强
+
+状态：
+
+- 当前优先级：`P0-P1`
+- 当前风险：中
+- 当前收益：高
 
 目标：
 
 - 已落地 ONNX session / input adapter / output adapter 的基础抽象，继续演进更通用的 ONNX 输入输出适配层。
 - 保持当前 provider 抽象不变，避免把服务层绑死在某一种模型输入格式上。
+
+与 OCR 的关系：
+
+- extractor 侧建议拆 `Session Layer / Input Adapter Layer / Output Adapter Layer`。
+- OCR 侧建议拆 `Preprocess Layer / Runtime Layer / Result Adapter Layer`。
+- 两者的共同目标都是把“模型/引擎差异”限制在适配层，不向 API、parser、`DocumentIR` 和 storage 扩散。
+
+当前状态总结：
+
+- `25.2.1` 可视为已完成。
+- `25.2.2` 可视为基础链路已打通：
+  - tokenizer + tensor 输入构造已实现
+  - float tensor 输出读取已接通
+  - span 解码与 synthetic 单测已覆盖
+  - 真实模型集成验证仍未完成
+- `25.2.3` 基础能力已完成，但仍缺真实模型回归测试和生产验证。
 
 建议拆成三层：
 
@@ -1671,7 +2033,15 @@ sidecar 建议继续保留以下最小字段：
 落地要点：
 
 - tokenizer 文件与模型文件一起版本化。
-- sidecar 已支持声明 `runtime_contract=tokenized`、tokenizer 路径和张量输入输出名，但当前仍返回明确的 not implemented 错误。
+- sidecar 已支持声明 `runtime_contract=tokenized`、tokenizer 路径和张量输入输出名。
+- 当前代码已经具备 tokenized 路线的基础能力：
+  - tokenizer 加载与 padding/truncation 配置
+  - prompt 线性化
+  - 长文滑窗
+  - `input_ids / attention_mask / token_type_ids` 张量构造
+  - `start_probs / end_probs` 输出解码
+  - span 到 evidence 的基础回绑
+- 但这一条链路还缺少“真实模型集成验证”这一层，因此当前状态应视为“已实现代码路径，但尚未完成生产验证”，不是最终完成态。
 - schema 需要先线性化成 prompt 或 instruction 文本。
 - 文本切片策略必须支持长文分页或滑窗，不能把全部 `plain_text` 强塞到单次推理。
 - 输出解码时需要保留 token offset 到原文字符区间的映射，便于 evidence 回绑。
@@ -1701,9 +2071,22 @@ sidecar 建议继续保留以下最小字段：
 
 - `onnx` provider 在成功路径下不再 fallback 到 heuristic extractor。
 - `/version` 能正确暴露当前 ONNX provider 名称。
-- 至少有一组真实模型集成测试覆盖“输入 -> ONNX -> JSON -> evidence”完整链路。
+- 至少有一组真实字符串 I/O 模型集成测试覆盖“输入 -> ONNX -> JSON -> evidence”完整链路。
+- 至少有一组真实 tokenized/UIE 模型集成测试覆盖“输入 -> tokenizer -> tensor -> span decode -> evidence”完整链路。
+
+下一动作建议：
+
+1. 先固定一组真实字符串 I/O 模型做集成样本。
+2. 再固定一组真实 tokenized/UIE 模型做回归样本。
+3. 最后再考虑把更通用的模型适配抽象进一步产品化。
 
 ### 25.3 持久化存储替换 In-Memory Store
+
+状态：
+
+- 当前优先级：`P0`
+- 当前风险：高
+- 当前收益：高
 
 目标：
 
@@ -1797,7 +2180,19 @@ cache_entries:
 - 事件流补连时能从持久化事件表回放历史。
 - 异步任务执行过程中服务异常退出，不会让任务状态永久停在 `extracting` 且不可恢复。
 
+下一动作建议：
+
+1. 先上 SQLite，不要直接跳 Postgres。
+2. 优先持久化 `tasks/results/events/cache` 四类核心数据。
+3. 先让 SSE 历史回放依赖持久化事件表，再继续扩展 worker 协议。
+
 ### 25.4 缓存淘汰、TTL 与租户隔离
+
+状态：
+
+- 当前优先级：`P0`
+- 当前风险：中
+- 当前收益：中高
 
 目标：
 
@@ -1851,7 +2246,19 @@ extract:{tenant_id}:{doc_hash}:{schema_hash}:{extractor_version}
 - 缓存容量达到上限后不会无限增长。
 - 不同租户提交相同文档时不会读到彼此的任务记录与缓存结果。
 
+下一动作建议：
+
+1. 先做 TTL 和后台清理。
+2. 再做 namespace 分层。
+3. 最后再补 tenant 级隔离和共享策略。
+
 ### 25.5 Webhook / WebSocket / 控制台
+
+状态：
+
+- 当前优先级：`P1-P2`
+- 当前风险：低
+- 当前收益：中
 
 目标：
 
@@ -1917,12 +2324,13 @@ P0：
 - SQLite 持久化 `tasks/results/events/cache`。
 - 缓存 TTL 与后台清理任务。
 - 为字符串 I/O ONNX 路线补真实模型集成测试与观测指标。
+- 本地 `local-onnx` OCR provider 最小闭环。
 
 P1：
 
-- tokenizer + tensor adapter。
 - Postgres 存储实现。
 - Webhook 回调。
+- 为 tokenized/UIE ONNX 路线补真实模型集成测试与回归集。
 
 P2：
 

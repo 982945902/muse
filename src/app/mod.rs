@@ -4,9 +4,12 @@ use crate::{
     docx::{DocxProvider, ZipDocxProvider},
     events::EventHub,
     extractor::{Extractor, build_extractor},
-    ocr::{HttpOcrProvider, OcrProvider, PlaceholderOcrProvider},
+    ocr::{
+        FallbackOcrProvider, HttpOcrProvider, LocalOnnxOcrProvider, OcrProvider,
+        PlaceholderOcrProvider,
+    },
     parser::{DefaultParser, Parser},
-    pdf::{LopdfTextLayerProvider, PdfProvider},
+    pdf::{CompositePdfProvider, PdfProvider},
     postprocess::{DefaultPostprocessor, Postprocessor},
     queue::{InMemoryQueue, TaskQueue},
     storage::{ExtractionStore, InMemoryStorage},
@@ -27,22 +30,36 @@ pub struct AppState {
     pub events: Arc<EventHub>,
 }
 
-pub fn build_state(config: &Config) -> AppState {
-    let ocr: Arc<dyn OcrProvider> = match config.ocr_provider.as_str() {
+fn build_ocr_provider_by_name(config: &Config, provider_name: &str) -> Arc<dyn OcrProvider> {
+    match provider_name {
         "http" => {
             let provider = HttpOcrProvider::from_config(config)
                 .unwrap_or_else(|error| panic!("failed to configure HTTP OCR provider: {error}"));
             Arc::new(provider)
         }
-        "placeholder" => Arc::new(PlaceholderOcrProvider),
+        "local-onnx" => {
+            let provider = LocalOnnxOcrProvider::from_config(config).unwrap_or_else(|error| {
+                panic!("failed to configure local ONNX OCR provider: {error}")
+            });
+            Arc::new(provider)
+        }
+        "placeholder" => Arc::new(PlaceholderOcrProvider::default()),
         other => panic!("unsupported OCR provider `{other}`"),
-    };
-    let pdf: Arc<dyn PdfProvider> = Arc::new(LopdfTextLayerProvider);
-    let docx: Arc<dyn DocxProvider> = Arc::new(ZipDocxProvider);
+    }
+}
+
+pub fn build_state_with_providers(
+    config: &Config,
+    ocr: Arc<dyn OcrProvider>,
+    pdf: Arc<dyn PdfProvider>,
+    docx: Arc<dyn DocxProvider>,
+) -> AppState {
+    let parser: Arc<dyn Parser> =
+        Arc::new(DefaultParser::new(ocr.clone(), pdf.clone(), docx.clone()));
 
     AppState {
         config: config.clone(),
-        parser: Arc::new(DefaultParser::new(ocr.clone(), pdf.clone(), docx.clone())),
+        parser,
         extractor: build_extractor(config),
         postprocessor: Arc::new(DefaultPostprocessor),
         ocr,
@@ -52,6 +69,25 @@ pub fn build_state(config: &Config) -> AppState {
         storage: Arc::new(InMemoryStorage::default()),
         events: Arc::new(EventHub::default()),
     }
+}
+
+pub fn build_state(config: &Config) -> AppState {
+    let primary_ocr = build_ocr_provider_by_name(config, &config.ocr_provider);
+    let ocr: Arc<dyn OcrProvider> = match config.ocr_fallback_provider.as_deref() {
+        Some(fallback_provider) if fallback_provider != config.ocr_provider => {
+            Arc::new(FallbackOcrProvider::new(
+                primary_ocr.clone(),
+                build_ocr_provider_by_name(config, fallback_provider),
+            ))
+        }
+        _ => primary_ocr,
+    };
+    let pdf: Arc<dyn PdfProvider> = Arc::new(
+        CompositePdfProvider::from_config(config)
+            .unwrap_or_else(|error| panic!("failed to configure PDF provider: {error}")),
+    );
+    let docx: Arc<dyn DocxProvider> = Arc::new(ZipDocxProvider);
+    build_state_with_providers(config, ocr, pdf, docx)
 }
 
 pub fn build_router(state: AppState) -> axum::Router {

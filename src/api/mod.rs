@@ -89,7 +89,9 @@ pub struct VersionResponse {
     pub extractor_provider: &'static str,
     pub postprocessor_provider: &'static str,
     pub ocr_provider: &'static str,
+    pub ocr_transport: &'static str,
     pub pdf_provider: &'static str,
+    pub pdf_raster_provider: String,
     pub docx_provider: &'static str,
     pub queue_provider: &'static str,
 }
@@ -125,7 +127,9 @@ async fn version(State(state): State<Arc<AppState>>) -> Json<VersionResponse> {
         extractor_provider: state.extractor.name(),
         postprocessor_provider: state.postprocessor.name(),
         ocr_provider: state.ocr.name(),
+        ocr_transport: state.ocr.transport_name(),
         pdf_provider: state.pdf.name(),
+        pdf_raster_provider: state.config.pdf_raster_provider.clone(),
         docx_provider: state.docx.name(),
         queue_provider: state.queue.name(),
     })
@@ -293,15 +297,22 @@ async fn run_parsed_extraction(
         }),
     )
     .await;
-    let outcome = execute_parsed_extraction(
-        state,
+    let outcome = match execute_parsed_extraction(
+        state.clone(),
         task_id.clone(),
         schema,
         options,
         parse_input,
         cache_key,
     )
-    .await?;
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            handle_sync_execution_error(&state, &task_id, &error).await;
+            return Err(error);
+        }
+    };
 
     Ok(Json(CreateExtractionResponse {
         task_id: task_id.clone(),
@@ -331,9 +342,22 @@ async fn run_normalized_extraction(
         }),
     )
     .await;
-    let outcome =
-        execute_normalized_extraction(state, task_id.clone(), schema, options, document, cache_key)
-            .await?;
+    let outcome = match execute_normalized_extraction(
+        state.clone(),
+        task_id.clone(),
+        schema,
+        options,
+        document,
+        cache_key,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            handle_sync_execution_error(&state, &task_id, &error).await;
+            return Err(error);
+        }
+    };
 
     Ok(Json(CreateExtractionResponse {
         task_id: task_id.clone(),
@@ -693,6 +717,8 @@ async fn publish_document_events(state: &Arc<AppState>, task_id: &str, document:
                     "ocr_provider": document.metadata.extra.get("ocr_provider"),
                     "ocr_model": document.metadata.extra.get("ocr_model"),
                     "ocr_transport": document.metadata.extra.get("ocr_transport"),
+                    "pdf_ocr_input": document.metadata.extra.get("pdf_ocr_input"),
+                    "pdf_raster_provider": document.metadata.extra.get("pdf_raster_provider"),
                 }),
             )
             .await;
@@ -728,6 +754,20 @@ async fn publish_failure_event(state: &Arc<AppState>, task_id: &str, error: &str
         }),
     )
     .await;
+}
+
+async fn handle_sync_execution_error(state: &Arc<AppState>, task_id: &str, error: &ApiError) {
+    publish_stage_event(state, task_id, "failed", "failed", Some(&error.to_string())).await;
+    publish_failure_event(state, task_id, &error.to_string()).await;
+    let _ = state
+        .storage
+        .upsert(TaskRecord {
+            task_id: task_id.to_string(),
+            status: TaskStatus::Failed,
+            result: None,
+            message: Some(error.to_string()),
+        })
+        .await;
 }
 
 fn build_incremental_documents(document: &DocumentIr) -> Vec<DocumentIr> {
@@ -1326,14 +1366,170 @@ mod tests {
     use crate::{
         app,
         config::Config,
+        docx::{DocxProvider, ZipDocxProvider},
         domain::{
-            BlockSourceKind, DocumentMetadata, Evidence, FieldValue, NormalizedPage,
+            BBox, BlockSourceKind, DocumentMetadata, Evidence, FieldValue, NormalizedPage,
             NormalizedTextBlock, PageIr, SourceType, TextBlock,
         },
+        ocr::{OcrLine, OcrOutput, OcrProvider, OcrRequest},
+        pdf::{PdfOcrPage, PdfOutput, PdfProvider, PdfRequest},
     };
+    use ::image::{ColorType, GenericImageView, ImageEncoder, codecs::png::PngEncoder};
+    use async_trait::async_trait;
     use axum::{body::Body, http::Request};
+    use serde::Deserialize;
     use serde_json::json;
+    use std::{fs, sync::Arc};
     use tower::util::ServiceExt;
+
+    struct RasterAwareOcrProvider;
+    struct RasterScanPdfProvider;
+    struct FailingOcrProvider;
+
+    #[derive(Debug, Deserialize)]
+    struct UploadRegressionFixture {
+        schema: SchemaSpec,
+        expected_raw_text: String,
+        expected_field_key: String,
+        expected_field_value: serde_json::Value,
+        expected_evidence_page_nos: Vec<u32>,
+        expected_page_ocr_done: UploadRegressionEventExpectation,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct UploadRegressionEventExpectation {
+        pdf_ocr_input: serde_json::Value,
+        pdf_raster_provider: serde_json::Value,
+        ocr_provider: serde_json::Value,
+        ocr_transport: serde_json::Value,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct UploadFailureRegressionFixture {
+        schema: SchemaSpec,
+        expected_http_status: u16,
+        expected_error_contains: String,
+        expected_failed_event: UploadFailureEventExpectation,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct UploadSyncFailureRegressionFixture {
+        schema: SchemaSpec,
+        expected_http_status: u16,
+        expected_error_contains: String,
+        expected_failed_event: UploadFailureEventExpectation,
+        expected_failed_stage: UploadFailureStageExpectation,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct UploadCacheHitRegressionFixture {
+        schema: SchemaSpec,
+        expected_raw_text: String,
+        expected_field_key: String,
+        expected_field_value: serde_json::Value,
+        expected_cache_hit: UploadCacheHitEventExpectation,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct UploadCacheHitEventExpectation {
+        hit_count: u64,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct UploadFailureEventExpectation {
+        message_contains: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct UploadFailureStageExpectation {
+        message_contains: String,
+    }
+
+    #[async_trait]
+    impl OcrProvider for RasterAwareOcrProvider {
+        fn name(&self) -> &'static str {
+            "raster-aware-ocr"
+        }
+
+        fn transport_name(&self) -> &'static str {
+            "inproc"
+        }
+
+        async fn recognize(&self, request: OcrRequest) -> anyhow::Result<OcrOutput> {
+            assert_eq!(request.mime_type.as_deref(), Some("image/png"));
+            assert!(request.bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+
+            let image = ::image::load_from_memory(&request.bytes).expect("decode png");
+            let pixel = image.get_pixel(0, 0).0;
+            let text = if pixel[1] > pixel[0] && pixel[1] > pixel[2] {
+                "岗位类型：图片运营"
+            } else if pixel[0] > pixel[2] {
+                "岗位类型：第一页结果"
+            } else {
+                "岗位类型：第二页结果"
+            };
+
+            Ok(OcrOutput {
+                lines: vec![OcrLine {
+                    text: text.to_string(),
+                    page_no: Some(1),
+                    bbox: Some(BBox {
+                        x1: 4.0,
+                        y1: 8.0,
+                        x2: 80.0,
+                        y2: 28.0,
+                    }),
+                    confidence: Some(0.95),
+                }],
+                provider: Some("raster-aware-ocr".to_string()),
+                model: Some("png-page-model".to_string()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl OcrProvider for FailingOcrProvider {
+        fn name(&self) -> &'static str {
+            "failing-ocr"
+        }
+
+        fn transport_name(&self) -> &'static str {
+            "inproc"
+        }
+
+        async fn recognize(&self, _request: OcrRequest) -> anyhow::Result<OcrOutput> {
+            anyhow::bail!("simulated OCR worker failure")
+        }
+    }
+
+    #[async_trait]
+    impl PdfProvider for RasterScanPdfProvider {
+        fn name(&self) -> &'static str {
+            "test-raster-scan-pdf"
+        }
+
+        async fn extract(&self, _request: PdfRequest) -> anyhow::Result<PdfOutput> {
+            Ok(PdfOutput {
+                text: String::new(),
+                page_count: Some(2),
+                extracted_text_layer: false,
+                page_texts: vec![],
+                raster_provider: Some("test-inline-rasterizer".to_string()),
+                raster_pages: vec![
+                    PdfOcrPage {
+                        page_no: 1,
+                        mime_type: Some("image/png".to_string()),
+                        bytes: encode_test_png(1, 1, &[255, 0, 0]),
+                    },
+                    PdfOcrPage {
+                        page_no: 2,
+                        mime_type: Some("image/png".to_string()),
+                        bytes: encode_test_png(1, 1, &[0, 0, 255]),
+                    },
+                ],
+            })
+        }
+    }
 
     #[tokio::test]
     async fn normalized_endpoint_accepts_valid_document() {
@@ -1441,6 +1637,18 @@ mod tests {
             payload.get("normalized_accepts_sdk_version_fallback"),
             Some(&serde_json::Value::Bool(true))
         );
+        assert_eq!(
+            payload.get("ocr_provider"),
+            Some(&serde_json::Value::String("placeholder-ocr".to_string()))
+        );
+        assert_eq!(
+            payload.get("ocr_transport"),
+            Some(&serde_json::Value::String("inproc".to_string()))
+        );
+        assert_eq!(
+            payload.get("pdf_raster_provider"),
+            Some(&serde_json::Value::String("none".to_string()))
+        );
     }
 
     #[tokio::test]
@@ -1494,8 +1702,370 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn upload_endpoint_extracts_scanned_pdf_via_raster_pages() {
+        let fixture =
+            load_upload_regression_fixture("fixtures/extraction/scanned_pdf_upload_fixture.json");
+        let state = Arc::new(test_state_with_providers(
+            Arc::new(RasterAwareOcrProvider),
+            Arc::new(RasterScanPdfProvider),
+            Arc::new(ZipDocxProvider),
+        ));
+        let router = app::build_router((*state).clone());
+        let boundary = "muse-boundary";
+        run_upload_regression_fixture(
+            router,
+            state,
+            fixture,
+            "scan.pdf",
+            "application/pdf",
+            b"%PDF-1.7 fake scanned".to_vec(),
+            boundary,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_extracts_image_via_fixture_regression() {
+        let fixture =
+            load_upload_regression_fixture("fixtures/extraction/image_upload_fixture.json");
+        let state = Arc::new(test_state_with_providers(
+            Arc::new(RasterAwareOcrProvider),
+            Arc::new(RasterScanPdfProvider),
+            Arc::new(ZipDocxProvider),
+        ));
+        let router = app::build_router((*state).clone());
+
+        run_upload_regression_fixture(
+            router,
+            state,
+            fixture,
+            "poster.png",
+            "image/png",
+            encode_test_png(1, 1, &[0, 255, 0]),
+            "muse-image-boundary",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_reuses_cache_via_fixture_regression() {
+        let fixture = load_upload_cache_hit_regression_fixture(
+            "fixtures/extraction/image_upload_cache_hit_fixture.json",
+        );
+        let state = Arc::new(test_state_with_providers(
+            Arc::new(RasterAwareOcrProvider),
+            Arc::new(RasterScanPdfProvider),
+            Arc::new(ZipDocxProvider),
+        ));
+        let router = app::build_router((*state).clone());
+
+        run_upload_cache_hit_regression_fixture(
+            router,
+            state,
+            fixture,
+            "poster.png",
+            "image/png",
+            encode_test_png(1, 1, &[0, 255, 0]),
+            "muse-image-cache-boundary",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_sync_failure_matches_fixture_regression() {
+        let fixture = load_upload_sync_failure_regression_fixture(
+            "fixtures/extraction/image_upload_sync_failure_fixture.json",
+        );
+        let state = Arc::new(test_state_with_providers(
+            Arc::new(FailingOcrProvider),
+            Arc::new(RasterScanPdfProvider),
+            Arc::new(ZipDocxProvider),
+        ));
+        let router = app::build_router((*state).clone());
+
+        run_upload_sync_failure_regression_fixture(
+            router,
+            state,
+            fixture,
+            "broken.png",
+            "image/png",
+            encode_test_png(1, 1, &[0, 255, 0]),
+            "muse-image-sync-failure-boundary",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_async_failure_matches_fixture_regression() {
+        let fixture = load_upload_failure_regression_fixture(
+            "fixtures/extraction/image_upload_async_failure_fixture.json",
+        );
+        let state = Arc::new(test_state_with_providers(
+            Arc::new(FailingOcrProvider),
+            Arc::new(RasterScanPdfProvider),
+            Arc::new(ZipDocxProvider),
+        ));
+        let router = app::build_router((*state).clone());
+        let boundary = "muse-image-failure-boundary";
+        let payload = send_upload_request(
+            router.clone(),
+            boundary,
+            &[
+                multipart_text_part("mode", "async"),
+                multipart_text_part(
+                    "schema",
+                    &serde_json::to_string(&fixture.schema).expect("schema json"),
+                ),
+                multipart_file_part(
+                    "file",
+                    "broken.png",
+                    "image/png",
+                    encode_test_png(1, 1, &[0, 255, 0]),
+                ),
+            ],
+        )
+        .await;
+
+        assert_eq!(payload.status.as_u16(), fixture.expected_http_status);
+        let task_id = payload
+            .payload
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("task id")
+            .to_string();
+        assert_eq!(
+            payload.payload.get("status"),
+            Some(&serde_json::json!("queued"))
+        );
+
+        wait_for_task_failure(&state, &task_id).await;
+
+        let record = state
+            .storage
+            .get(&task_id)
+            .await
+            .expect("get task")
+            .expect("task record");
+        assert!(matches!(record.status, TaskStatus::Failed));
+        assert!(
+            record
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&fixture.expected_error_contains)
+        );
+
+        let task_lookup = fetch_task_lookup(router.clone(), &task_id).await;
+        assert_eq!(task_lookup.status, StatusCode::OK);
+        assert_eq!(
+            task_lookup.payload.get("status"),
+            Some(&serde_json::json!("failed"))
+        );
+        assert!(
+            task_lookup
+                .payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains(&fixture.expected_error_contains)
+        );
+
+        let subscription = state
+            .events
+            .subscribe(&task_id)
+            .await
+            .expect("subscription");
+        let failed_event = subscription
+            .history
+            .iter()
+            .find(|event| event.event_type == "failed")
+            .expect("failed event");
+        assert!(
+            failed_event
+                .payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains(&fixture.expected_failed_event.message_contains)
+        );
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_async_pdf_raster_failure_matches_fixture_regression() {
+        let fixture = load_upload_failure_regression_fixture(
+            "fixtures/extraction/pdf_raster_async_failure_fixture.json",
+        );
+        let mut config = test_config();
+        config.pdf_raster_provider = "pdftoppm".to_string();
+        config.pdftoppm_bin = Some("__definitely_missing_pdftoppm_binary__".to_string());
+
+        let state = Arc::new(app::build_state(&config));
+        let router = app::build_router((*state).clone());
+        let boundary = "muse-pdf-raster-failure-boundary";
+        let payload = send_upload_request(
+            router.clone(),
+            boundary,
+            &[
+                multipart_text_part("mode", "async"),
+                multipart_text_part(
+                    "schema",
+                    &serde_json::to_string(&fixture.schema).expect("schema json"),
+                ),
+                multipart_file_part("file", "scan.pdf", "application/pdf", build_blank_pdf()),
+            ],
+        )
+        .await;
+
+        assert_eq!(payload.status.as_u16(), fixture.expected_http_status);
+        let task_id = payload
+            .payload
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("task id")
+            .to_string();
+        assert_eq!(
+            payload.payload.get("status"),
+            Some(&serde_json::json!("queued"))
+        );
+
+        wait_for_task_failure(&state, &task_id).await;
+
+        let record = state
+            .storage
+            .get(&task_id)
+            .await
+            .expect("get task")
+            .expect("task record");
+        assert!(matches!(record.status, TaskStatus::Failed));
+        assert!(
+            record
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&fixture.expected_error_contains)
+        );
+
+        let task_lookup = fetch_task_lookup(router.clone(), &task_id).await;
+        assert_eq!(task_lookup.status, StatusCode::OK);
+        assert_eq!(
+            task_lookup.payload.get("status"),
+            Some(&serde_json::json!("failed"))
+        );
+        assert!(
+            task_lookup
+                .payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains(&fixture.expected_error_contains)
+        );
+
+        let subscription = state
+            .events
+            .subscribe(&task_id)
+            .await
+            .expect("subscription");
+        let failed_event = subscription
+            .history
+            .iter()
+            .find(|event| event.event_type == "failed")
+            .expect("failed event");
+        assert!(
+            failed_event
+                .payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains(&fixture.expected_failed_event.message_contains)
+        );
+    }
+
+    #[tokio::test]
+    async fn page_ocr_done_event_includes_pdf_raster_metadata() {
+        let state = Arc::new(app::build_state(&test_config()));
+        let task_id = "task-pdf-events";
+        state.events.ensure_task(task_id).await;
+
+        let mut metadata = DocumentMetadata::default();
+        metadata
+            .extra
+            .insert("ocr_provider".to_string(), "raster-aware-ocr".to_string());
+        metadata
+            .extra
+            .insert("ocr_model".to_string(), "png-page-model".to_string());
+        metadata
+            .extra
+            .insert("ocr_transport".to_string(), "inproc".to_string());
+        metadata
+            .extra
+            .insert("pdf_ocr_input".to_string(), "page_rasters".to_string());
+        metadata.extra.insert(
+            "pdf_raster_provider".to_string(),
+            "pdftoppm-rasterizer".to_string(),
+        );
+
+        publish_document_events(
+            &state,
+            task_id,
+            &DocumentIr {
+                doc_id: "doc-pdf-events".to_string(),
+                source_type: SourceType::Pdf,
+                pages: vec![PageIr {
+                    page_no: 1,
+                    width: None,
+                    height: None,
+                    blocks: vec![TextBlock {
+                        block_id: "b1".to_string(),
+                        page_no: 1,
+                        text: "岗位类型：扫描件".to_string(),
+                        bbox: None,
+                        confidence: Some(0.92),
+                        source_kind: BlockSourceKind::Ocr,
+                    }],
+                }],
+                plain_text: "岗位类型：扫描件".to_string(),
+                metadata,
+            },
+        )
+        .await;
+
+        let subscription = state.events.subscribe(task_id).await.expect("subscription");
+        let page_ocr_done = subscription
+            .history
+            .iter()
+            .find(|event| event.event_type == "page.ocr_done")
+            .expect("page.ocr_done event");
+
+        assert_eq!(
+            page_ocr_done.payload.get("pdf_ocr_input"),
+            Some(&serde_json::Value::String("page_rasters".to_string()))
+        );
+        assert_eq!(
+            page_ocr_done.payload.get("pdf_raster_provider"),
+            Some(&serde_json::Value::String(
+                "pdftoppm-rasterizer".to_string()
+            ))
+        );
+    }
+
     fn test_router() -> Router {
-        let config = Config {
+        let config = test_config();
+        let state = app::build_state(&config);
+        app::build_router(state)
+    }
+
+    fn test_state_with_providers(
+        ocr: Arc<dyn OcrProvider>,
+        pdf: Arc<dyn PdfProvider>,
+        docx: Arc<dyn DocxProvider>,
+    ) -> app::AppState {
+        let config = test_config();
+        app::build_state_with_providers(&config, ocr, pdf, docx)
+    }
+
+    fn test_config() -> Config {
+        Config {
             listen_addr: "127.0.0.1:0".parse().expect("socket addr"),
             service_name: "test-service".to_string(),
             log_filter: "info".to_string(),
@@ -1507,12 +2077,556 @@ mod tests {
             onnx_input_schema_name: "schema".to_string(),
             onnx_output_json_name: "json_output".to_string(),
             ocr_provider: "placeholder".to_string(),
+            ocr_fallback_provider: None,
             ocr_worker_url: None,
             ocr_timeout_ms: 5_000,
             ocr_worker_token: None,
+            ocr_model_dir: None,
+            ocr_threads: 1,
+            ocr_prewarm: false,
+            pdf_raster_provider: "none".to_string(),
+            pdftoppm_bin: None,
+        }
+    }
+
+    fn multipart_text_part(name: &str, value: &str) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.extend_from_slice(b"\r\n");
+        bytes
+    }
+
+    fn multipart_file_part(
+        name: &str,
+        file_name: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Vec<u8> {
+        let mut part = Vec::new();
+        part.extend_from_slice(
+            format!(
+                "Content-Disposition: form-data; name=\"{name}\"; filename=\"{file_name}\"\r\n"
+            )
+            .as_bytes(),
+        );
+        part.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+        part.extend_from_slice(&bytes);
+        part.extend_from_slice(b"\r\n");
+        part
+    }
+
+    fn multipart_body(boundary: &str, parts: &[Vec<u8>]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for part in parts {
+            body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+            body.extend_from_slice(part);
+        }
+        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    fn encode_test_png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let encoder = PngEncoder::new(&mut bytes);
+        encoder
+            .write_image(rgb, width, height, ColorType::Rgb8.into())
+            .expect("encode png");
+        bytes
+    }
+
+    fn build_blank_pdf() -> Vec<u8> {
+        use lopdf::{
+            Document, Object, Stream,
+            content::{Content, Operation},
+            dictionary,
         };
-        let state = app::build_state(&config);
-        app::build_router(state)
+
+        let mut document = Document::with_version("1.5");
+        let pages_id = document.new_object_id();
+        let page_id = document.new_object_id();
+        let resources_id = document.add_object(dictionary! {});
+        let content = Content {
+            operations: vec![Operation::new("BT", vec![]), Operation::new("ET", vec![])],
+        };
+        let content_id = document.add_object(Stream::new(
+            dictionary! {},
+            content.encode().expect("encode content"),
+        ));
+
+        let page = dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Contents" => content_id,
+            "Resources" => resources_id,
+            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
+        };
+        document.objects.insert(page_id, Object::Dictionary(page));
+
+        let pages = dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![page_id.into()],
+            "Count" => 1,
+        };
+        document.objects.insert(pages_id, Object::Dictionary(pages));
+
+        let catalog_id = document.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        document.trailer.set("Root", catalog_id);
+        document.compress();
+
+        let mut buffer = Vec::new();
+        document.save_to(&mut buffer).expect("save pdf");
+        buffer
+    }
+
+    fn load_upload_regression_fixture(path: &str) -> UploadRegressionFixture {
+        let raw = fs::read_to_string(path).expect("read upload fixture");
+        serde_json::from_str(&raw).expect("parse upload fixture")
+    }
+
+    fn load_upload_failure_regression_fixture(path: &str) -> UploadFailureRegressionFixture {
+        let raw = fs::read_to_string(path).expect("read upload failure fixture");
+        serde_json::from_str(&raw).expect("parse upload failure fixture")
+    }
+
+    fn load_upload_sync_failure_regression_fixture(
+        path: &str,
+    ) -> UploadSyncFailureRegressionFixture {
+        let raw = fs::read_to_string(path).expect("read upload sync failure fixture");
+        serde_json::from_str(&raw).expect("parse upload sync failure fixture")
+    }
+
+    fn load_upload_cache_hit_regression_fixture(path: &str) -> UploadCacheHitRegressionFixture {
+        let raw = fs::read_to_string(path).expect("read upload cache-hit fixture");
+        serde_json::from_str(&raw).expect("parse upload cache-hit fixture")
+    }
+
+    async fn run_upload_regression_fixture(
+        router: Router,
+        state: Arc<app::AppState>,
+        fixture: UploadRegressionFixture,
+        file_name: &str,
+        content_type: &str,
+        file_bytes: Vec<u8>,
+        boundary: &str,
+    ) {
+        let payload = send_standard_upload_request(
+            router.clone(),
+            "sync",
+            &fixture.schema,
+            file_name,
+            content_type,
+            file_bytes,
+            boundary,
+        )
+        .await;
+
+        assert_eq!(payload.status, StatusCode::OK);
+        let task_id = payload
+            .payload
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("task id");
+        let result = payload.payload.get("result").expect("result");
+        assert_eq!(
+            result.get("raw_text"),
+            Some(&serde_json::Value::String(fixture.expected_raw_text))
+        );
+        assert_eq!(
+            result.pointer("/fields/0/key"),
+            Some(&serde_json::Value::String(fixture.expected_field_key))
+        );
+        assert_eq!(
+            result.pointer("/fields/0/value"),
+            Some(&fixture.expected_field_value)
+        );
+        for (index, page_no) in fixture.expected_evidence_page_nos.iter().enumerate() {
+            assert_eq!(
+                result.pointer(&format!("/fields/0/evidences/{index}/page_no")),
+                Some(&serde_json::json!(page_no))
+            );
+        }
+
+        let subscription = state.events.subscribe(task_id).await.expect("subscription");
+        let page_ocr_done = subscription
+            .history
+            .iter()
+            .find(|event| event.event_type == "page.ocr_done")
+            .expect("page.ocr_done event");
+        assert_eq!(
+            page_ocr_done.payload.get("pdf_ocr_input"),
+            Some(&fixture.expected_page_ocr_done.pdf_ocr_input)
+        );
+        assert_eq!(
+            page_ocr_done.payload.get("pdf_raster_provider"),
+            Some(&fixture.expected_page_ocr_done.pdf_raster_provider)
+        );
+        assert_eq!(
+            page_ocr_done.payload.get("ocr_provider"),
+            Some(&fixture.expected_page_ocr_done.ocr_provider)
+        );
+        assert_eq!(
+            page_ocr_done.payload.get("ocr_transport"),
+            Some(&fixture.expected_page_ocr_done.ocr_transport)
+        );
+    }
+
+    async fn run_upload_cache_hit_regression_fixture(
+        router: Router,
+        state: Arc<app::AppState>,
+        fixture: UploadCacheHitRegressionFixture,
+        file_name: &str,
+        content_type: &str,
+        file_bytes: Vec<u8>,
+        boundary: &str,
+    ) {
+        let first = run_upload_cache_hit_request(
+            router.clone(),
+            &fixture.schema,
+            file_name,
+            content_type,
+            file_bytes.clone(),
+            boundary,
+        )
+        .await;
+
+        assert_eq!(first.cached, Some(false));
+        assert_eq!(
+            first.result.get("raw_text"),
+            Some(&serde_json::Value::String(
+                fixture.expected_raw_text.clone()
+            ))
+        );
+        assert_eq!(
+            first.result.pointer("/fields/0/key"),
+            Some(&serde_json::Value::String(
+                fixture.expected_field_key.clone()
+            ))
+        );
+        assert_eq!(
+            first.result.pointer("/fields/0/value"),
+            Some(&fixture.expected_field_value)
+        );
+
+        let first_subscription = state
+            .events
+            .subscribe(&first.task_id)
+            .await
+            .expect("first subscription");
+        assert!(
+            first_subscription
+                .history
+                .iter()
+                .any(|event| event.event_type == "page.ocr_done"),
+            "first request should execute OCR before caching"
+        );
+
+        let second = run_upload_cache_hit_request(
+            router,
+            &fixture.schema,
+            file_name,
+            content_type,
+            file_bytes,
+            boundary,
+        )
+        .await;
+
+        assert_eq!(second.cached, Some(true));
+        assert_eq!(
+            second.result.get("raw_text"),
+            Some(&serde_json::Value::String(fixture.expected_raw_text))
+        );
+        assert_eq!(
+            second.result.pointer("/fields/0/key"),
+            Some(&serde_json::Value::String(fixture.expected_field_key))
+        );
+        assert_eq!(
+            second.result.pointer("/fields/0/value"),
+            Some(&fixture.expected_field_value)
+        );
+
+        let second_subscription = state
+            .events
+            .subscribe(&second.task_id)
+            .await
+            .expect("second subscription");
+        let cache_hit = second_subscription
+            .history
+            .iter()
+            .find(|event| event.event_type == "cache.hit")
+            .expect("cache.hit event");
+        assert_eq!(
+            cache_hit.payload.get("hit_count"),
+            Some(&serde_json::json!(fixture.expected_cache_hit.hit_count))
+        );
+        assert!(
+            cache_hit
+                .payload
+                .get("cache_key")
+                .and_then(serde_json::Value::as_str)
+                .is_some(),
+            "cache.hit should expose cache_key"
+        );
+        assert!(
+            second_subscription
+                .history
+                .iter()
+                .all(|event| event.event_type != "page.ocr_done"),
+            "cached request should not rerun OCR"
+        );
+    }
+
+    async fn run_upload_sync_failure_regression_fixture(
+        router: Router,
+        state: Arc<app::AppState>,
+        fixture: UploadSyncFailureRegressionFixture,
+        file_name: &str,
+        content_type: &str,
+        file_bytes: Vec<u8>,
+        boundary: &str,
+    ) {
+        let before_task_ids = state.events.task_ids().await;
+        let payload = send_standard_upload_request(
+            router.clone(),
+            "sync",
+            &fixture.schema,
+            file_name,
+            content_type,
+            file_bytes,
+            boundary,
+        )
+        .await;
+
+        assert_eq!(payload.status.as_u16(), fixture.expected_http_status);
+        assert!(
+            payload
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains(&fixture.expected_error_contains)
+        );
+
+        let after_task_ids = state.events.task_ids().await;
+        let task_id = after_task_ids
+            .into_iter()
+            .find(|candidate| !before_task_ids.iter().any(|before| before == candidate))
+            .expect("new sync failure task id");
+
+        let record = state
+            .storage
+            .get(&task_id)
+            .await
+            .expect("get task")
+            .expect("task record");
+        assert!(matches!(record.status, TaskStatus::Failed));
+        assert!(
+            record
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains(&fixture.expected_error_contains)
+        );
+
+        let task_lookup = fetch_task_lookup(router.clone(), &task_id).await;
+        assert_eq!(task_lookup.status, StatusCode::OK);
+        assert_eq!(
+            task_lookup.payload.get("status"),
+            Some(&serde_json::json!("failed"))
+        );
+        assert!(
+            task_lookup
+                .payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains(&fixture.expected_error_contains)
+        );
+
+        let subscription = state
+            .events
+            .subscribe(&task_id)
+            .await
+            .expect("subscription");
+        let failed_stage = subscription
+            .history
+            .iter()
+            .find(|event| {
+                event.event_type == "stage.changed"
+                    && event.payload.get("stage") == Some(&serde_json::json!("failed"))
+            })
+            .expect("failed stage event");
+        assert_eq!(
+            failed_stage.payload.get("status"),
+            Some(&serde_json::json!("failed"))
+        );
+        assert!(
+            failed_stage
+                .payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains(&fixture.expected_failed_stage.message_contains)
+        );
+
+        let failed_event = subscription
+            .history
+            .iter()
+            .find(|event| event.event_type == "failed")
+            .expect("failed event");
+        assert!(
+            failed_event
+                .payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains(&fixture.expected_failed_event.message_contains)
+        );
+    }
+
+    async fn run_upload_cache_hit_request(
+        router: Router,
+        schema: &SchemaSpec,
+        file_name: &str,
+        content_type: &str,
+        file_bytes: Vec<u8>,
+        boundary: &str,
+    ) -> UploadRequestOutcome {
+        let payload = send_standard_upload_request(
+            router,
+            "sync",
+            schema,
+            file_name,
+            content_type,
+            file_bytes,
+            boundary,
+        )
+        .await;
+        assert_eq!(payload.status, StatusCode::OK);
+        UploadRequestOutcome {
+            task_id: payload
+                .payload
+                .get("task_id")
+                .and_then(serde_json::Value::as_str)
+                .expect("task id")
+                .to_string(),
+            cached: payload
+                .payload
+                .get("cached")
+                .and_then(serde_json::Value::as_bool),
+            result: payload.payload.get("result").cloned().expect("result"),
+        }
+    }
+
+    struct UploadRequestOutcome {
+        task_id: String,
+        cached: Option<bool>,
+        result: serde_json::Value,
+    }
+
+    struct UploadHttpResponse {
+        status: StatusCode,
+        payload: serde_json::Value,
+    }
+
+    async fn send_standard_upload_request(
+        router: Router,
+        mode: &str,
+        schema: &SchemaSpec,
+        file_name: &str,
+        content_type: &str,
+        file_bytes: Vec<u8>,
+        boundary: &str,
+    ) -> UploadHttpResponse {
+        let options = serde_json::json!({
+            "return_raw_text": true,
+            "return_evidence": true
+        });
+        send_upload_request(
+            router,
+            boundary,
+            &[
+                multipart_text_part("mode", mode),
+                multipart_text_part(
+                    "schema",
+                    &serde_json::to_string(schema).expect("schema json"),
+                ),
+                multipart_text_part("options", &options.to_string()),
+                multipart_file_part("file", file_name, content_type, file_bytes),
+            ],
+        )
+        .await
+    }
+
+    async fn send_upload_request(
+        router: Router,
+        boundary: &str,
+        parts: &[Vec<u8>],
+    ) -> UploadHttpResponse {
+        let body = multipart_body(boundary, parts);
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/extractions/upload")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+
+        UploadHttpResponse {
+            status,
+            payload: serde_json::from_slice(&body).expect("json"),
+        }
+    }
+
+    async fn fetch_task_lookup(router: Router, task_id: &str) -> UploadHttpResponse {
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/extractions/{task_id}"))
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body bytes");
+
+        UploadHttpResponse {
+            status,
+            payload: serde_json::from_slice(&body).expect("json"),
+        }
+    }
+
+    async fn wait_for_task_failure(state: &Arc<app::AppState>, task_id: &str) {
+        for _ in 0..40 {
+            if let Some(record) = state.storage.get(task_id).await.expect("get task") {
+                if matches!(record.status, TaskStatus::Failed) {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        panic!("task `{task_id}` did not reach failed status in time");
     }
 
     fn normalized_request_payload() -> serde_json::Value {

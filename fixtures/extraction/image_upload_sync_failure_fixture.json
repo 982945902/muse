@@ -1,0 +1,24 @@
+{
+  "schema": {
+    "name": "image-demo-sync-failure",
+    "version": "1",
+    "fields": [
+      {
+        "key": "岗位类型",
+        "field_type": "string",
+        "required": false,
+        "multiple": false,
+        "children": [],
+        "hints": []
+      }
+    ]
+  },
+  "expected_http_status": 500,
+  "expected_error_contains": "simulated OCR worker failure",
+  "expected_failed_event": {
+    "message_contains": "simulated OCR worker failure"
+  },
+  "expected_failed_stage": {
+    "message_contains": "simulated OCR worker failure"
+  }
+}

@@ -11,12 +11,14 @@ use onnxruntime_sys_ng as ort_sys;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value, json};
+#[cfg(feature = "onnx-runtime")]
+use std::collections::HashMap;
 #[cfg(all(feature = "onnx-runtime", not(target_family = "windows")))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(all(feature = "onnx-runtime", target_family = "windows"))]
 use std::os::windows::ffi::OsStrExt;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -28,12 +30,12 @@ use std::{
     ptr,
     sync::OnceLock,
 };
-use uuid::Uuid;
 #[cfg(feature = "onnx-runtime")]
 use tokenizers::{
     PaddingDirection as TokenizerPaddingDirection, PaddingParams, PaddingStrategy, Tokenizer,
     TruncationDirection, TruncationParams, TruncationStrategy,
 };
+use uuid::Uuid;
 
 #[async_trait]
 pub trait Extractor: Send + Sync {
@@ -922,7 +924,12 @@ impl OnnxInputAdapter for TokenizedUieInputAdapter {
                 }
 
                 input_ids.extend(window.get_ids().iter().map(|value| *value as i64));
-                attention_mask.extend(window.get_attention_mask().iter().map(|value| *value as i64));
+                attention_mask.extend(
+                    window
+                        .get_attention_mask()
+                        .iter()
+                        .map(|value| *value as i64),
+                );
                 if self.token_type_ids_name.is_some() {
                     token_type_ids.extend(window.get_type_ids().iter().map(|value| *value as i64));
                 }
@@ -1017,7 +1024,10 @@ impl OnnxOutputAdapter for UieSpanOutputAdapter {
     ) -> anyhow::Result<ExtractionResult> {
         let context = match context {
             OnnxPreparedContext::Uie(context) => context,
-            other => anyhow::bail!("UIE output adapter received unexpected context: {:?}", other),
+            other => anyhow::bail!(
+                "UIE output adapter received unexpected context: {:?}",
+                other
+            ),
         };
 
         let start_payload = output.items.get(&self.start_probs_name).ok_or_else(|| {
@@ -1028,7 +1038,9 @@ impl OnnxOutputAdapter for UieSpanOutputAdapter {
         })?;
 
         let (start_values, start_shape) = match start_payload {
-            OnnxOutputPayload::FloatTensor { values, shape } => (values.as_slice(), shape.as_slice()),
+            OnnxOutputPayload::FloatTensor { values, shape } => {
+                (values.as_slice(), shape.as_slice())
+            }
             other => anyhow::bail!(
                 "ONNX output `{}` expected a float tensor, got {:?}",
                 self.start_probs_name,
@@ -1036,7 +1048,9 @@ impl OnnxOutputAdapter for UieSpanOutputAdapter {
             ),
         };
         let (end_values, end_shape) = match end_payload {
-            OnnxOutputPayload::FloatTensor { values, shape } => (values.as_slice(), shape.as_slice()),
+            OnnxOutputPayload::FloatTensor { values, shape } => {
+                (values.as_slice(), shape.as_slice())
+            }
             other => anyhow::bail!(
                 "ONNX output `{}` expected a float tensor, got {:?}",
                 self.end_probs_name,
@@ -1046,7 +1060,9 @@ impl OnnxOutputAdapter for UieSpanOutputAdapter {
 
         let start_view = FloatTensorView::new(start_values, start_shape)?;
         let end_view = FloatTensorView::new(end_values, end_shape)?;
-        if start_view.batch_size != context.plans.len() || end_view.batch_size != context.plans.len() {
+        if start_view.batch_size != context.plans.len()
+            || end_view.batch_size != context.plans.len()
+        {
             anyhow::bail!(
                 "UIE output batch size mismatch: start={}, end={}, plans={}",
                 start_view.batch_size,
@@ -1059,10 +1075,8 @@ impl OnnxOutputAdapter for UieSpanOutputAdapter {
         for (batch_index, plan) in context.plans.iter().enumerate() {
             let start_row = start_view.row(batch_index)?;
             let end_row = end_view.row(batch_index)?;
-            let decoded = finalize_uie_predictions(
-                decode_uie_window_spans(plan, start_row, end_row),
-                doc,
-            );
+            let decoded =
+                finalize_uie_predictions(decode_uie_window_spans(plan, start_row, end_row), doc);
             if decoded.is_empty() {
                 continue;
             }
@@ -1346,11 +1360,9 @@ fn finalize_uie_predictions(
     let mut items = Vec::new();
 
     for candidate in candidates {
-        let Some(raw_value) = slice_text_by_char_range(
-            &doc.plain_text,
-            candidate.start_char,
-            candidate.end_char,
-        ) else {
+        let Some(raw_value) =
+            slice_text_by_char_range(&doc.plain_text, candidate.start_char, candidate.end_char)
+        else {
             continue;
         };
         let raw_value = raw_value.trim().to_string();
@@ -1507,8 +1519,7 @@ fn build_uie_leaf_field_value(
         }
 
         let confidence = Some(
-            (confidences.iter().copied().sum::<f32>() / confidences.len() as f32)
-                .clamp(0.0, 1.0),
+            (confidences.iter().copied().sum::<f32>() / confidences.len() as f32).clamp(0.0, 1.0),
         );
         return FieldValue {
             key: field.key.clone(),
@@ -1628,12 +1639,23 @@ struct OrtIoInfo {
 #[derive(Debug)]
 struct OrtValueGuard {
     ptr: *mut ort_sys::OrtValue,
+    _int64_values: Option<Vec<i64>>,
 }
 
 #[cfg(feature = "onnx-runtime")]
 impl OrtValueGuard {
     fn new(ptr: *mut ort_sys::OrtValue) -> Self {
-        Self { ptr }
+        Self {
+            ptr,
+            _int64_values: None,
+        }
+    }
+
+    fn with_int64_values(ptr: *mut ort_sys::OrtValue, values: Vec<i64>) -> Self {
+        Self {
+            ptr,
+            _int64_values: Some(values),
+        }
     }
 
     fn as_const_ptr(&self) -> *const ort_sys::OrtValue {
@@ -1710,6 +1732,43 @@ fn normalize_string_input_shape(
             ),
         }
     }
+    Ok(shape)
+}
+
+#[cfg(feature = "onnx-runtime")]
+fn normalize_dense_input_shape(
+    input_name: &str,
+    dimensions: &[Option<u32>],
+    requested_shape: &[i64],
+) -> anyhow::Result<Vec<usize>> {
+    if dimensions.len() != requested_shape.len() {
+        anyhow::bail!(
+            "ONNX input `{input_name}` expected rank {}, got {}",
+            dimensions.len(),
+            requested_shape.len()
+        )
+    }
+
+    let mut shape = Vec::with_capacity(dimensions.len());
+    for (axis, (declared, requested)) in dimensions.iter().zip(requested_shape.iter()).enumerate() {
+        if *requested <= 0 {
+            anyhow::bail!(
+                "ONNX input `{input_name}` has invalid requested shape {} at axis {axis}",
+                requested
+            )
+        }
+
+        let requested = *requested as usize;
+        match declared {
+            Some(value) if *value as usize != requested => anyhow::bail!(
+                "ONNX input `{input_name}` expects dimension {} at axis {axis}, got {}",
+                value,
+                requested
+            ),
+            Some(_) | None => shape.push(requested),
+        }
+    }
+
     Ok(shape)
 }
 
@@ -1901,7 +1960,6 @@ fn validate_onnx_string_contract(
     Ok(())
 }
 
-
 #[cfg(feature = "onnx-runtime")]
 fn validate_onnx_tokenized_contract(
     inputs: &[OrtIoInfo],
@@ -1939,7 +1997,8 @@ fn validate_named_float_output(outputs: &[OrtIoInfo], expected_name: &str) -> an
         .find(|output| output.name == expected_name)
         .ok_or_else(|| anyhow::anyhow!("ONNX output `{expected_name}` was not found in model"))?;
 
-    if output.tensor_type != ort_sys::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT {
+    if output.tensor_type != ort_sys::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT
+    {
         anyhow::bail!("ONNX output `{expected_name}` must be `float`")
     }
 
@@ -2041,6 +2100,67 @@ fn build_string_input_value(
 }
 
 #[cfg(feature = "onnx-runtime")]
+fn build_int64_input_value(
+    input: &OrtIoInfo,
+    values: &[i64],
+    shape: &[i64],
+) -> anyhow::Result<OrtValueGuard> {
+    let normalized_shape = normalize_dense_input_shape(&input.name, &input.dimensions, shape)?;
+    let element_count = normalized_shape.iter().product::<usize>();
+    if element_count != values.len() {
+        anyhow::bail!(
+            "ONNX input `{}` expected {} values from shape {:?}, got {}",
+            input.name,
+            element_count,
+            normalized_shape,
+            values.len()
+        )
+    }
+
+    let shape_i64 = normalized_shape
+        .iter()
+        .map(|dimension| *dimension as i64)
+        .collect::<Vec<_>>();
+    let mut owned_values = values.to_vec();
+    let mut memory_info_ptr = ptr::null_mut();
+    ort_status_to_result(
+        unsafe {
+            ort_api().CreateCpuMemoryInfo.unwrap()(
+                ort_sys::OrtAllocatorType_OrtArenaAllocator,
+                ort_sys::OrtMemType_OrtMemTypeDefault,
+                &mut memory_info_ptr,
+            )
+        },
+        "failed to create ONNX CPU memory info for int64 input",
+    )?;
+
+    let mut value_ptr = ptr::null_mut();
+    let create_result = ort_status_to_result(
+        unsafe {
+            ort_api().CreateTensorWithDataAsOrtValue.unwrap()(
+                memory_info_ptr,
+                owned_values.as_mut_ptr().cast::<c_void>(),
+                owned_values.len() * std::mem::size_of::<i64>(),
+                shape_i64.as_ptr(),
+                shape_i64.len(),
+                ort_sys::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64,
+                &mut value_ptr,
+            )
+        },
+        &format!(
+            "failed to create ONNX int64 tensor for input `{}`",
+            input.name
+        ),
+    );
+    unsafe {
+        ort_api().ReleaseMemoryInfo.unwrap()(memory_info_ptr);
+    }
+    create_result?;
+
+    Ok(OrtValueGuard::with_int64_values(value_ptr, owned_values))
+}
+
+#[cfg(feature = "onnx-runtime")]
 fn read_string_tensor_output_values(
     value_ptr: *mut ort_sys::OrtValue,
 ) -> anyhow::Result<Vec<String>> {
@@ -2105,6 +2225,61 @@ fn read_string_tensor_output_values(
 }
 
 #[cfg(feature = "onnx-runtime")]
+fn read_dense_f32_tensor_output(
+    value_ptr: *mut ort_sys::OrtValue,
+) -> anyhow::Result<(Vec<f32>, Vec<usize>)> {
+    let mut tensor_info_ptr = ptr::null_mut();
+    ort_status_to_result(
+        unsafe { ort_api().GetTensorTypeAndShape.unwrap()(value_ptr, &mut tensor_info_ptr) },
+        "failed to read ONNX float output tensor shape",
+    )?;
+
+    let dimensions = extract_dimensions(tensor_info_ptr)?;
+    unsafe {
+        ort_api().ReleaseTensorTypeAndShapeInfo.unwrap()(tensor_info_ptr);
+    }
+
+    let shape = if dimensions.is_empty() {
+        vec![1]
+    } else {
+        dimensions
+            .into_iter()
+            .map(|dimension| {
+                dimension.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "ONNX float output tensor contains an unexpected dynamic dimension"
+                    )
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|dimension| dimension as usize)
+            .collect::<Vec<_>>()
+    };
+
+    let element_count = shape
+        .iter()
+        .copied()
+        .fold(1_usize, |count, dimension| count.saturating_mul(dimension));
+    if element_count == 0 {
+        anyhow::bail!("ONNX float output tensor is empty")
+    }
+
+    let mut data_ptr = ptr::null_mut();
+    ort_status_to_result(
+        unsafe { ort_api().GetTensorMutableData.unwrap()(value_ptr, &mut data_ptr) },
+        "failed to access ONNX float output tensor data",
+    )?;
+    if data_ptr.is_null() {
+        anyhow::bail!("ONNX float output tensor returned a null data pointer")
+    }
+
+    let values =
+        unsafe { std::slice::from_raw_parts(data_ptr.cast::<f32>(), element_count).to_vec() };
+    Ok((values, shape))
+}
+
+#[cfg(feature = "onnx-runtime")]
 fn build_ort_input_value(
     allocator_ptr: *mut ort_sys::OrtAllocator,
     input: &OrtIoInfo,
@@ -2113,6 +2288,9 @@ fn build_ort_input_value(
     match payload {
         OnnxInputPayload::StringScalar(value) => {
             build_string_input_value(allocator_ptr, input, value)
+        }
+        OnnxInputPayload::Int64Tensor { values, shape } => {
+            build_int64_input_value(input, values, shape)
         }
     }
 }
@@ -2126,6 +2304,10 @@ fn decode_ort_output_value(
         ort_sys::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_STRING => Ok(
             OnnxOutputPayload::StringTensor(read_string_tensor_output_values(value_ptr)?),
         ),
+        ort_sys::ONNXTensorElementDataType_ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT => {
+            let (values, shape) = read_dense_f32_tensor_output(value_ptr)?;
+            Ok(OnnxOutputPayload::FloatTensor { values, shape })
+        }
         other => anyhow::bail!(
             "ONNX output `{}` returned unsupported tensor type `{}` for current runtime adapter",
             output.name,
@@ -3009,9 +3191,15 @@ mod tests {
             onnx_input_schema_name: "schema".to_string(),
             onnx_output_json_name: "json_output".to_string(),
             ocr_provider: "placeholder".to_string(),
+            ocr_fallback_provider: None,
             ocr_worker_url: None,
             ocr_timeout_ms: 5_000,
             ocr_worker_token: None,
+            ocr_model_dir: None,
+            ocr_threads: 1,
+            ocr_prewarm: false,
+            pdf_raster_provider: "none".to_string(),
+            pdftoppm_bin: None,
         };
 
         let error = OnnxRuntimeExtractor::from_config(&config).expect_err("missing model path");
@@ -3104,7 +3292,7 @@ mod tests {
 
     #[cfg(feature = "onnx-runtime")]
     #[test]
-    fn tokenized_runtime_contract_reports_clear_not_implemented_error() {
+    fn tokenized_runtime_contract_is_recognized_as_supported() {
         let temp_root =
             std::env::temp_dir().join(format!("muse-onnx-tokenized-runtime-{}", Uuid::new_v4()));
         fs::create_dir_all(&temp_root).expect("temp dir");
@@ -3135,11 +3323,7 @@ mod tests {
 
         let contract = resolve_onnx_model_contract(&model_path, None, "text", "schema", "output")
             .expect("contract");
-        let error =
-            ensure_supported_runtime_contract(&contract).expect_err("tokenized should be pending");
-
-        assert!(error.to_string().contains("runtime_contract `tokenized`"));
-        assert!(error.to_string().contains("tokenizer_path"));
+        ensure_supported_runtime_contract(&contract).expect("tokenized should be supported");
 
         let _ = fs::remove_dir_all(temp_root);
     }
@@ -3269,6 +3453,75 @@ mod tests {
             "系统支持 HTTP OCR worker"
         );
         assert_eq!(result.fields[0].evidences[0].source_block_ids.len(), 1);
+    }
+
+    #[cfg(feature = "onnx-runtime")]
+    #[test]
+    fn uie_output_adapter_decodes_float_tensor_predictions_into_field_values() {
+        let adapter = UieSpanOutputAdapter::new("start_probs".to_string(), "end_probs".to_string());
+        let schema = SchemaSpec {
+            name: "demo".to_string(),
+            version: "1".to_string(),
+            fields: vec![FieldSpec {
+                key: "岗位类型".to_string(),
+                field_type: FieldType::String,
+                required: false,
+                multiple: false,
+                children: vec![],
+                hints: vec![],
+            }],
+        };
+        let doc = sample_document("岗位类型：图片运营", vec!["岗位类型：图片运营"]);
+        let context = OnnxPreparedContext::Uie(UiePreparedContext {
+            plans: vec![UieFieldWindowPlan {
+                field_path: vec!["岗位类型".to_string()],
+                token_spans: vec![
+                    None,
+                    None,
+                    None,
+                    Some(UieTokenSpan {
+                        start_char: 5,
+                        end_char: 7,
+                    }),
+                    Some(UieTokenSpan {
+                        start_char: 7,
+                        end_char: 9,
+                    }),
+                ],
+            }],
+        });
+        let outputs = OnnxOutputs {
+            items: HashMap::from([
+                (
+                    "start_probs".to_string(),
+                    OnnxOutputPayload::FloatTensor {
+                        values: vec![0.0, 0.0, 0.0, 0.95, 0.05],
+                        shape: vec![1, 5],
+                    },
+                ),
+                (
+                    "end_probs".to_string(),
+                    OnnxOutputPayload::FloatTensor {
+                        values: vec![0.0, 0.0, 0.0, 0.05, 0.96],
+                        shape: vec![1, 5],
+                    },
+                ),
+            ]),
+        };
+
+        let result = adapter
+            .decode(outputs, &context, &doc, &schema)
+            .expect("decode uie float outputs");
+
+        assert_eq!(result.fields.len(), 1);
+        assert_eq!(
+            result.fields[0].value,
+            Value::String("图片运营".to_string())
+        );
+        assert!(result.fields[0].confidence.unwrap_or_default() > 0.9);
+        assert_eq!(result.fields[0].evidences.len(), 1);
+        assert_eq!(result.fields[0].evidences[0].page_no, Some(1));
+        assert!(result.fields[0].evidences[0].text.contains("图片运营"));
     }
 
     #[test]

@@ -1,0 +1,21 @@
+{
+  "schema": {
+    "name": "pdf-raster-failure",
+    "version": "1",
+    "fields": [
+      {
+        "key": "岗位类型",
+        "field_type": "string",
+        "required": false,
+        "multiple": false,
+        "children": [],
+        "hints": []
+      }
+    ]
+  },
+  "expected_http_status": 200,
+  "expected_error_contains": "failed to execute `__definitely_missing_pdftoppm_binary__`",
+  "expected_failed_event": {
+    "message_contains": "failed to execute `__definitely_missing_pdftoppm_binary__`"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "schema": {
+    "name": "scan-demo",
+    "version": "1",
+    "fields": [
+      {
+        "key": "岗位类型",
+        "field_type": "string",
+        "required": false,
+        "multiple": true,
+        "children": [],
+        "hints": []
+      }
+    ]
+  },
+  "expected_raw_text": "岗位类型：第一页结果\n岗位类型：第二页结果",
+  "expected_field_key": "岗位类型",
+  "expected_field_value": ["第一页结果", "第二页结果"],
+  "expected_evidence_page_nos": [1, 2],
+  "expected_page_ocr_done": {
+    "pdf_ocr_input": "page_rasters",
+    "pdf_raster_provider": "test-inline-rasterizer",
+    "ocr_provider": "raster-aware-ocr",
+    "ocr_transport": "inproc"
+  }
+}

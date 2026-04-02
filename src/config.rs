@@ -13,9 +13,15 @@ pub struct Config {
     pub onnx_input_schema_name: String,
     pub onnx_output_json_name: String,
     pub ocr_provider: String,
+    pub ocr_fallback_provider: Option<String>,
     pub ocr_worker_url: Option<String>,
     pub ocr_timeout_ms: u64,
     pub ocr_worker_token: Option<String>,
+    pub ocr_model_dir: Option<String>,
+    pub ocr_threads: usize,
+    pub ocr_prewarm: bool,
+    pub pdf_raster_provider: String,
+    pub pdftoppm_bin: Option<String>,
 }
 
 impl Config {
@@ -46,16 +52,45 @@ impl Config {
         let ocr_provider = env::var("MUSE_OCR_PROVIDER").unwrap_or_else(|_| {
             if env::var("MUSE_OCR_WORKER_URL").is_ok() {
                 "http".to_string()
+            } else if env::var("MUSE_OCR_MODEL_DIR").is_ok() {
+                "local-onnx".to_string()
             } else {
                 "placeholder".to_string()
             }
         });
+        let ocr_fallback_provider = env::var("MUSE_OCR_FALLBACK_PROVIDER")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
         let ocr_worker_url = env::var("MUSE_OCR_WORKER_URL").ok();
         let ocr_timeout_ms = env::var("MUSE_OCR_TIMEOUT_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(5_000);
         let ocr_worker_token = env::var("MUSE_OCR_WORKER_TOKEN").ok();
+        let ocr_model_dir = env::var("MUSE_OCR_MODEL_DIR").ok();
+        let ocr_threads = env::var("MUSE_OCR_THREADS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1);
+        let ocr_prewarm = env::var("MUSE_OCR_PREWARM")
+            .ok()
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false);
+        let pdf_raster_provider = env::var("MUSE_PDF_RASTER_PROVIDER").unwrap_or_else(|_| {
+            if env::var("MUSE_PDFTOPPM_BIN").is_ok() {
+                "pdftoppm".to_string()
+            } else {
+                "none".to_string()
+            }
+        });
+        let pdftoppm_bin = env::var("MUSE_PDFTOPPM_BIN").ok();
 
         Ok(Self {
             listen_addr,
@@ -69,9 +104,15 @@ impl Config {
             onnx_input_schema_name,
             onnx_output_json_name,
             ocr_provider,
+            ocr_fallback_provider,
             ocr_worker_url,
             ocr_timeout_ms,
             ocr_worker_token,
+            ocr_model_dir,
+            ocr_threads,
+            ocr_prewarm,
+            pdf_raster_provider,
+            pdftoppm_bin,
         })
     }
 }

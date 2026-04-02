@@ -74,10 +74,10 @@ impl Parser for ImageParser {
                 .extra
                 .insert("ocr_model".to_string(), model);
         }
-        document
-            .metadata
-            .extra
-            .insert("ocr_transport".to_string(), self.ocr.name().to_string());
+        document.metadata.extra.insert(
+            "ocr_transport".to_string(),
+            self.ocr.transport_name().to_string(),
+        );
         Ok(document)
     }
 }
