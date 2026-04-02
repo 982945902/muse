@@ -34,14 +34,40 @@ pub struct OcrRequest {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OcrLine {
+    #[serde(default)]
+    pub block_id: Option<String>,
     pub text: String,
     pub page_no: Option<u32>,
     pub bbox: Option<BBox>,
     pub confidence: Option<f32>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OcrBlock {
+    pub block_id: String,
+    pub text: String,
+    pub page_no: Option<u32>,
+    pub bbox: Option<BBox>,
+    pub confidence: Option<f32>,
+    #[serde(default)]
+    pub line_count: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct OcrPage {
+    pub page_no: u32,
+    pub width: Option<f32>,
+    pub height: Option<f32>,
+    pub rotation_degrees: Option<f32>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OcrOutput {
+    #[serde(default)]
+    pub pages: Vec<OcrPage>,
+    #[serde(default)]
+    pub blocks: Vec<OcrBlock>,
+    #[serde(default)]
     pub lines: Vec<OcrLine>,
     pub provider: Option<String>,
     pub model: Option<String>,
@@ -69,6 +95,9 @@ struct OcrPreparedPage {
     page_no: u32,
     mime_type: Option<String>,
     bytes: Vec<u8>,
+    width: Option<f32>,
+    height: Option<f32>,
+    rotation_degrees: Option<f32>,
     raster: Option<OcrPreparedRaster>,
 }
 
@@ -88,17 +117,41 @@ struct OcrPreparedRaster {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct RawOcrOutput {
+    #[serde(default)]
+    pages: Vec<RawOcrPage>,
+    #[serde(default)]
+    blocks: Vec<RawOcrBlock>,
+    #[serde(default)]
     lines: Vec<RawOcrLine>,
     provider: Option<String>,
     model: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct RawOcrPage {
+    page_no: u32,
+    width: Option<f32>,
+    height: Option<f32>,
+    rotation_degrees: Option<f32>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct RawOcrLine {
+    block_id: Option<String>,
     text: String,
     page_no: Option<u32>,
     bbox: Option<BBox>,
     confidence: Option<f32>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct RawOcrBlock {
+    block_id: Option<String>,
+    text: String,
+    page_no: Option<u32>,
+    bbox: Option<BBox>,
+    confidence: Option<f32>,
+    line_count: Option<u32>,
 }
 
 trait OcrPreprocessor: Send + Sync {
@@ -157,6 +210,7 @@ struct PassthroughOcrPreprocessor;
 
 impl OcrPreprocessor for PassthroughOcrPreprocessor {
     fn prepare(&self, request: OcrRequest) -> anyhow::Result<OcrPreparedInput> {
+        let dimensions = infer_image_dimensions(&request.bytes);
         Ok(OcrPreparedInput {
             file_name: request.file_name,
             mime_type: request.mime_type.clone(),
@@ -165,6 +219,9 @@ impl OcrPreprocessor for PassthroughOcrPreprocessor {
                 page_no: 1,
                 mime_type: request.mime_type,
                 bytes: request.bytes,
+                width: dimensions.map(|(width, _)| width as f32),
+                height: dimensions.map(|(_, height)| height as f32),
+                rotation_degrees: None,
                 raster: None,
             }],
         })
@@ -208,6 +265,9 @@ impl OcrPreprocessor for LocalOnnxImagePreprocessor {
                 page_no: 1,
                 mime_type: request.mime_type,
                 bytes: request.bytes,
+                width: Some(raster.original_width as f32),
+                height: Some(raster.original_height as f32),
+                rotation_degrees: None,
                 raster: Some(raster),
             }],
         })
@@ -267,25 +327,12 @@ struct NormalizeOcrResultAdapter;
 
 impl OcrResultAdapter for NormalizeOcrResultAdapter {
     fn adapt(&self, raw: RawOcrOutput) -> anyhow::Result<OcrOutput> {
-        let lines = raw
-            .lines
-            .into_iter()
-            .filter_map(|line| {
-                let text = line.text.trim().to_string();
-                if text.is_empty() {
-                    return None;
-                }
-
-                Some(OcrLine {
-                    text,
-                    page_no: line.page_no.filter(|page_no| *page_no > 0),
-                    bbox: line.bbox,
-                    confidence: line.confidence,
-                })
-            })
-            .collect();
+        let mut lines = normalize_ocr_lines(raw.lines);
+        let blocks = normalize_ocr_blocks(raw.blocks, &mut lines);
 
         Ok(OcrOutput {
+            pages: normalize_ocr_pages(raw.pages),
+            blocks,
             lines,
             provider: raw.provider,
             model: raw.model,
@@ -299,13 +346,17 @@ struct PlaceholderOcrRuntime;
 #[async_trait]
 impl OcrRuntime for PlaceholderOcrRuntime {
     async fn recognize(&self, input: OcrPreparedInput) -> anyhow::Result<RawOcrOutput> {
+        let pages = raw_pages_from_prepared_input(&input);
         let file_name = input.file_name.unwrap_or_else(|| "unnamed".to_string());
         let mime_type = input.mime_type.unwrap_or_else(|| "unknown".to_string());
         let byte_size = input.original_bytes.len();
-        let page_no = input.pages.first().map(|page| page.page_no).unwrap_or(1);
+        let page_no = pages.first().map(|page| page.page_no).unwrap_or(1);
 
         Ok(RawOcrOutput {
+            pages,
+            blocks: vec![],
             lines: vec![RawOcrLine {
+                block_id: None,
                 text: format!(
                     "image OCR provider not implemented yet\nfile_name: {file_name}\nmime_type: {mime_type}\nbyte_size: {byte_size}"
                 ),
@@ -407,6 +458,12 @@ impl OcrRuntime for HttpOcrRuntime {
         })?;
 
         Ok(RawOcrOutput {
+            pages: if payload.pages.is_empty() {
+                raw_pages_from_prepared_input(&input)
+            } else {
+                payload.pages
+            },
+            blocks: payload.blocks,
             lines: payload.lines,
             provider: payload.provider,
             model: payload.model,
@@ -639,6 +696,10 @@ fn resolve_local_onnx_model_path(
 trait LocalOcrBackend: Send + Sync {
     fn prewarm(&self) -> anyhow::Result<()>;
     fn run_detection(&self, page: &OcrPreparedPage) -> anyhow::Result<OcrDetectionResult>;
+    fn run_classification(
+        &self,
+        patches: &[OcrRecognitionPatch],
+    ) -> anyhow::Result<OcrClassificationRun>;
     fn run_recognition(
         &self,
         patches: &[OcrRecognitionPatch],
@@ -692,6 +753,7 @@ impl LocalOnnxOcrRuntime {
 impl OcrRuntime for LocalOnnxOcrRuntime {
     async fn recognize(&self, input: OcrPreparedInput) -> anyhow::Result<RawOcrOutput> {
         let mut lines = Vec::new();
+        let mut pages = Vec::new();
 
         for page in &input.pages {
             let detection = self.backend.run_detection(page)?;
@@ -707,22 +769,191 @@ impl OcrRuntime for LocalOnnxOcrRuntime {
                     )
                 })
                 .unwrap_or_default();
+            let classification = self.backend.run_classification(&recognition_patches)?;
+            let classified_patches =
+                apply_classification_to_patches(&recognition_patches, &classification)?;
             let recognition = self
                 .backend
-                .run_recognition(&recognition_patches, &self.recognition_charset)?;
+                .run_recognition(&classified_patches, &self.recognition_charset)?;
             lines.extend(assemble_recognized_lines(
                 page.page_no,
                 &detection,
                 &recognition,
             )?);
+            pages.push(RawOcrPage {
+                page_no: page.page_no.max(1),
+                width: page.width,
+                height: page.height,
+                rotation_degrees: aggregate_page_rotation_degrees(&classification)
+                    .or(page.rotation_degrees),
+            });
         }
 
         Ok(RawOcrOutput {
+            pages,
+            blocks: vec![],
             lines,
             provider: Some("local-onnx-ocr".to_string()),
             model: Some(self.model_summary.clone()),
         })
     }
+}
+
+fn infer_image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    image::load_from_memory(bytes)
+        .ok()
+        .map(|image| image.dimensions())
+}
+
+fn raw_pages_from_prepared_input(input: &OcrPreparedInput) -> Vec<RawOcrPage> {
+    input
+        .pages
+        .iter()
+        .map(|page| RawOcrPage {
+            page_no: page.page_no.max(1),
+            width: page.width,
+            height: page.height,
+            rotation_degrees: page.rotation_degrees,
+        })
+        .collect()
+}
+
+fn normalize_ocr_pages(pages: Vec<RawOcrPage>) -> Vec<OcrPage> {
+    let mut pages = pages
+        .into_iter()
+        .filter(|page| page.page_no > 0)
+        .map(|page| OcrPage {
+            page_no: page.page_no,
+            width: page.width.filter(|value| *value > 0.0),
+            height: page.height.filter(|value| *value > 0.0),
+            rotation_degrees: page.rotation_degrees,
+        })
+        .collect::<Vec<_>>();
+    pages.sort_by_key(|page| page.page_no);
+    pages.dedup_by_key(|page| page.page_no);
+    pages
+}
+
+fn normalize_ocr_lines(lines: Vec<RawOcrLine>) -> Vec<OcrLine> {
+    lines
+        .into_iter()
+        .filter_map(|line| {
+            let text = line.text.trim().to_string();
+            if text.is_empty() {
+                return None;
+            }
+
+            Some(OcrLine {
+                block_id: normalize_ocr_block_id(line.block_id),
+                text,
+                page_no: line.page_no.filter(|page_no| *page_no > 0),
+                bbox: line.bbox,
+                confidence: line.confidence,
+            })
+        })
+        .collect()
+}
+
+fn normalize_ocr_blocks(raw_blocks: Vec<RawOcrBlock>, lines: &mut [OcrLine]) -> Vec<OcrBlock> {
+    if raw_blocks.is_empty() {
+        return synthesize_ocr_blocks_from_lines(lines);
+    }
+
+    let mut blocks = Vec::new();
+    for (index, block) in raw_blocks.into_iter().enumerate() {
+        let text = block.text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+
+        let page_no = block.page_no.filter(|page_no| *page_no > 0);
+        let block_id = normalize_ocr_block_id(block.block_id)
+            .unwrap_or_else(|| synthesize_ocr_block_id(page_no, index));
+        let inferred_line_count = lines
+            .iter()
+            .filter(|line| line.block_id.as_deref() == Some(block_id.as_str()))
+            .count();
+
+        blocks.push(OcrBlock {
+            block_id,
+            text,
+            page_no,
+            bbox: block.bbox,
+            confidence: block.confidence,
+            line_count: block.line_count.or_else(|| {
+                if inferred_line_count > 0 {
+                    Some(inferred_line_count as u32)
+                } else {
+                    None
+                }
+            }),
+        });
+    }
+
+    blocks
+}
+
+fn synthesize_ocr_blocks_from_lines(lines: &mut [OcrLine]) -> Vec<OcrBlock> {
+    lines
+        .iter_mut()
+        .enumerate()
+        .map(|(index, line)| {
+            let block_id = line
+                .block_id
+                .clone()
+                .unwrap_or_else(|| synthesize_ocr_block_id(line.page_no, index));
+            line.block_id = Some(block_id.clone());
+
+            OcrBlock {
+                block_id,
+                text: line.text.clone(),
+                page_no: line.page_no,
+                bbox: line.bbox.clone(),
+                confidence: line.confidence,
+                line_count: Some(1),
+            }
+        })
+        .collect()
+}
+
+fn normalize_ocr_block_id(block_id: Option<String>) -> Option<String> {
+    block_id.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    })
+}
+
+fn synthesize_ocr_block_id(page_no: Option<u32>, index: usize) -> String {
+    match page_no {
+        Some(page_no) => format!("ocr-p{page_no}-b{}", index + 1),
+        None => format!("ocr-b{}", index + 1),
+    }
+}
+
+fn aggregate_page_rotation_degrees(classification: &OcrClassificationRun) -> Option<f32> {
+    let mut scores = std::collections::BTreeMap::<i32, f32>::new();
+
+    for prediction in &classification.predictions {
+        if !prediction.confidence.is_finite() || prediction.confidence <= 0.0 {
+            continue;
+        }
+        let rotation = prediction.rotation_degrees.rem_euclid(360.0).round() as i32;
+        *scores.entry(rotation).or_default() += prediction.confidence;
+    }
+
+    scores
+        .into_iter()
+        .max_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.0.cmp(&right.0))
+        })
+        .map(|(rotation, _)| rotation as f32)
 }
 
 type LocalOnnxPipeline =
@@ -759,6 +990,7 @@ impl LocalOnnxOcrProvider {
 
     #[cfg(test)]
     pub(crate) fn from_test_fixture(fixture: TestLocalOcrFixture) -> Self {
+        let patch_count = fixture.candidates.len();
         let runtime = LocalOnnxOcrRuntime::from_parts(
             fixture.model_summary,
             Box::new(StaticLocalOcrBackend {
@@ -774,8 +1006,22 @@ impl LocalOnnxOcrProvider {
                         })
                         .collect(),
                 },
+                classification: OcrClassificationRun {
+                    patch_count,
+                    executed_patches: fixture.classifications.len(),
+                    predictions: fixture
+                        .classifications
+                        .into_iter()
+                        .map(|prediction| OcrClassificationPrediction {
+                            patch_index: prediction.patch_index,
+                            rotation_degrees: prediction.rotation_degrees,
+                            confidence: prediction.confidence,
+                        })
+                        .collect(),
+                    outputs: Vec::new(),
+                },
                 recognition: OcrRecognitionRun {
-                    patch_count: fixture.predictions.len(),
+                    patch_count,
                     executed_patches: fixture.predictions.len(),
                     predictions: fixture
                         .predictions
@@ -1443,6 +1689,7 @@ struct OcrRecognitionPatch {
     width: u32,
     height: u32,
     channels: u32,
+    rotation_degrees: f32,
     chw_f32: Vec<f32>,
 }
 
@@ -1475,6 +1722,35 @@ struct OcrRecognitionPrediction {
     confidence: f32,
 }
 
+#[cfg_attr(not(any(test, feature = "onnx-runtime")), allow(dead_code))]
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct OcrClassificationOutputSummary {
+    patch_index: usize,
+    output_name: String,
+    shape: Vec<usize>,
+    value_count: usize,
+    max_value: Option<f32>,
+}
+
+#[cfg_attr(not(any(test, feature = "onnx-runtime")), allow(dead_code))]
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+struct OcrClassificationRun {
+    patch_count: usize,
+    executed_patches: usize,
+    predictions: Vec<OcrClassificationPrediction>,
+    outputs: Vec<OcrClassificationOutputSummary>,
+}
+
+#[cfg_attr(not(any(test, feature = "onnx-runtime")), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct OcrClassificationPrediction {
+    patch_index: usize,
+    rotation_degrees: f32,
+    confidence: f32,
+}
+
 #[derive(Clone, Debug)]
 struct OcrCharset {
     tokens: Vec<String>,
@@ -1497,16 +1773,26 @@ pub(crate) struct TestLocalOcrPrediction {
 
 #[cfg(test)]
 #[derive(Clone, Debug)]
+pub(crate) struct TestLocalOcrClassification {
+    pub patch_index: usize,
+    pub rotation_degrees: f32,
+    pub confidence: f32,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
 pub(crate) struct TestLocalOcrFixture {
     pub model_summary: String,
     pub charset: Vec<String>,
     pub candidates: Vec<TestLocalOcrCandidate>,
+    pub classifications: Vec<TestLocalOcrClassification>,
     pub predictions: Vec<TestLocalOcrPrediction>,
 }
 
 #[cfg(test)]
 struct StaticLocalOcrBackend {
     detection: OcrDetectionResult,
+    classification: OcrClassificationRun,
     recognition: OcrRecognitionRun,
 }
 
@@ -1518,6 +1804,13 @@ impl LocalOcrBackend for StaticLocalOcrBackend {
 
     fn run_detection(&self, _page: &OcrPreparedPage) -> anyhow::Result<OcrDetectionResult> {
         Ok(self.detection.clone())
+    }
+
+    fn run_classification(
+        &self,
+        _patches: &[OcrRecognitionPatch],
+    ) -> anyhow::Result<OcrClassificationRun> {
+        Ok(self.classification.clone())
     }
 
     fn run_recognition(
@@ -1590,6 +1883,7 @@ fn build_recognition_patch(
         width: target_width,
         height: target_height,
         channels: 3,
+        rotation_degrees: 0.0,
         chw_f32,
     })
 }
@@ -1708,6 +2002,7 @@ fn assemble_recognized_lines(
         }
 
         lines.push(RawOcrLine {
+            block_id: None,
             text,
             page_no: Some(page_no),
             bbox: Some(candidate.bbox.clone()),
@@ -1765,6 +2060,203 @@ fn decode_recognition_output(
         0.0
     };
     Ok((text, confidence))
+}
+
+#[cfg_attr(not(any(test, feature = "onnx-runtime")), allow(dead_code))]
+fn decode_classification_output(output: &OcrTensorOutput) -> anyhow::Result<(f32, f32)> {
+    let logits = normalize_classification_logits(&output.shape, &output.values)?;
+    let (class_index, class_score) = logits
+        .iter()
+        .copied()
+        .enumerate()
+        .max_by(|left, right| {
+            left.1
+                .partial_cmp(&right.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .ok_or_else(|| anyhow::anyhow!("OCR classification output is empty"))?;
+
+    let rotation_degrees = match logits.len() {
+        2 => match class_index {
+            0 => 0.0,
+            1 => 180.0,
+            _ => unreachable!(),
+        },
+        4 => match class_index {
+            0 => 0.0,
+            1 => 90.0,
+            2 => 180.0,
+            3 => 270.0,
+            _ => unreachable!(),
+        },
+        class_count => anyhow::bail!(
+            "unsupported OCR classification class count {class_count}; expected 2 or 4"
+        ),
+    };
+
+    Ok((rotation_degrees, class_score))
+}
+
+#[cfg_attr(not(any(test, feature = "onnx-runtime")), allow(dead_code))]
+fn normalize_classification_logits<'a>(
+    shape: &[usize],
+    values: &'a [f32],
+) -> anyhow::Result<&'a [f32]> {
+    match shape {
+        [classes] => {
+            if values.len() != *classes {
+                anyhow::bail!(
+                    "OCR classification logits shape {:?} does not match value count {}",
+                    shape,
+                    values.len()
+                );
+            }
+            Ok(values)
+        }
+        [batch, classes] if *batch >= 1 => {
+            if values.len() < *classes {
+                anyhow::bail!(
+                    "OCR classification logits shape {:?} requires at least {} values, got {}",
+                    shape,
+                    classes,
+                    values.len()
+                );
+            }
+            Ok(&values[..*classes])
+        }
+        [batch, channels, classes] if *batch >= 1 && *channels >= 1 => {
+            if values.len() < *classes {
+                anyhow::bail!(
+                    "OCR classification logits shape {:?} requires at least {} values, got {}",
+                    shape,
+                    classes,
+                    values.len()
+                );
+            }
+            Ok(&values[..*classes])
+        }
+        [batch, classes, one, two] if *batch >= 1 && *one == 1 && *two == 1 => {
+            if values.len() < *classes {
+                anyhow::bail!(
+                    "OCR classification logits shape {:?} requires at least {} values, got {}",
+                    shape,
+                    classes,
+                    values.len()
+                );
+            }
+            Ok(&values[..*classes])
+        }
+        other => anyhow::bail!(
+            "unsupported OCR classification output shape {:?}; expected [C], [1,C], [1,1,C], or [1,C,1,1]",
+            other
+        ),
+    }
+}
+
+#[cfg_attr(not(any(test, feature = "onnx-runtime")), allow(dead_code))]
+fn apply_classification_to_patches(
+    patches: &[OcrRecognitionPatch],
+    classification: &OcrClassificationRun,
+) -> anyhow::Result<Vec<OcrRecognitionPatch>> {
+    let mut classified = patches.to_vec();
+
+    for prediction in &classification.predictions {
+        let patch = classified.get_mut(prediction.patch_index).ok_or_else(|| {
+            anyhow::anyhow!("OCR classification prediction index is out of bounds")
+        })?;
+        if !prediction.confidence.is_finite() || prediction.confidence <= 0.0 {
+            continue;
+        }
+        if prediction.rotation_degrees.rem_euclid(360.0) == 0.0 {
+            continue;
+        }
+        *patch = rotate_recognition_patch(patch, prediction.rotation_degrees)?;
+    }
+
+    Ok(classified)
+}
+
+#[cfg_attr(not(any(test, feature = "onnx-runtime")), allow(dead_code))]
+fn rotate_recognition_patch(
+    patch: &OcrRecognitionPatch,
+    rotation_degrees: f32,
+) -> anyhow::Result<OcrRecognitionPatch> {
+    let normalized = rotation_degrees.rem_euclid(360.0);
+    let quarter_turns = match normalized as i32 {
+        0 => 0,
+        90 => 1,
+        180 => 2,
+        270 => 3,
+        _ => anyhow::bail!(
+            "unsupported OCR classification rotation `{rotation_degrees}`; expected 0/90/180/270"
+        ),
+    };
+
+    let (chw_f32, width, height) = rotate_chw_tensor(
+        &patch.chw_f32,
+        patch.width,
+        patch.height,
+        patch.channels,
+        quarter_turns,
+    )?;
+
+    Ok(OcrRecognitionPatch {
+        bbox: patch.bbox.clone(),
+        width,
+        height,
+        channels: patch.channels,
+        rotation_degrees: normalized,
+        chw_f32,
+    })
+}
+
+#[cfg_attr(not(any(test, feature = "onnx-runtime")), allow(dead_code))]
+fn rotate_chw_tensor(
+    chw: &[f32],
+    width: u32,
+    height: u32,
+    channels: u32,
+    quarter_turns: i32,
+) -> anyhow::Result<(Vec<f32>, u32, u32)> {
+    let quarter_turns = quarter_turns.rem_euclid(4);
+    let channel_size = (width as usize).saturating_mul(height as usize);
+    let expected_len = channel_size.saturating_mul(channels as usize);
+    if chw.len() != expected_len {
+        anyhow::bail!(
+            "OCR classification rotation expected {expected_len} CHW values for {channels}x{width}x{height}, got {}",
+            chw.len()
+        );
+    }
+    if quarter_turns == 0 {
+        return Ok((chw.to_vec(), width, height));
+    }
+
+    let (rotated_width, rotated_height) = if quarter_turns % 2 == 0 {
+        (width, height)
+    } else {
+        (height, width)
+    };
+    let mut rotated = vec![0.0_f32; chw.len()];
+
+    for channel in 0..channels as usize {
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let src_index = channel * channel_size + y * width as usize + x;
+                let (dest_x, dest_y) = match quarter_turns {
+                    1 => (height as usize - 1 - y, x),
+                    2 => (width as usize - 1 - x, height as usize - 1 - y),
+                    3 => (y, width as usize - 1 - x),
+                    _ => unreachable!(),
+                };
+                let dest_index = channel * (rotated_width as usize * rotated_height as usize)
+                    + dest_y * rotated_width as usize
+                    + dest_x;
+                rotated[dest_index] = chw[src_index];
+            }
+        }
+    }
+
+    Ok((rotated, rotated_width, rotated_height))
 }
 
 #[cfg_attr(not(any(test, feature = "onnx-runtime")), allow(dead_code))]
@@ -2249,6 +2741,73 @@ impl LocalOnnxRuntimeBackend {
             outputs,
         })
     }
+
+    fn run_classification(
+        &self,
+        patches: &[OcrRecognitionPatch],
+    ) -> anyhow::Result<OcrClassificationRun> {
+        let Some(classification) = &self._classification else {
+            return Ok(OcrClassificationRun {
+                patch_count: patches.len(),
+                executed_patches: 0,
+                predictions: Vec::new(),
+                outputs: Vec::new(),
+            });
+        };
+
+        if patches.is_empty() {
+            return Ok(OcrClassificationRun {
+                patch_count: 0,
+                executed_patches: 0,
+                predictions: Vec::new(),
+                outputs: Vec::new(),
+            });
+        }
+
+        let input = classification.find_primary_image_input("classification")?;
+        let executed_patches = patches.len();
+        let mut predictions = Vec::new();
+        let mut outputs = Vec::new();
+
+        for (patch_index, patch) in patches.iter().enumerate() {
+            let patch_outputs = classification.run_single_float_input(
+                &input.name,
+                &patch.chw_f32,
+                &[
+                    1,
+                    patch.channels as i64,
+                    patch.height as i64,
+                    patch.width as i64,
+                ],
+            )?;
+            let best_output = patch_outputs
+                .iter()
+                .max_by_key(|output| output.values.len())
+                .ok_or_else(|| anyhow::anyhow!("OCR classification session returned no outputs"))?;
+            let (rotation_degrees, confidence) = decode_classification_output(best_output)?;
+            predictions.push(OcrClassificationPrediction {
+                patch_index,
+                rotation_degrees,
+                confidence,
+            });
+            outputs.extend(patch_outputs.into_iter().map(|output| {
+                OcrClassificationOutputSummary {
+                    patch_index,
+                    output_name: output.name,
+                    shape: output.shape,
+                    value_count: output.values.len(),
+                    max_value: output.values.iter().copied().reduce(f32::max),
+                }
+            }));
+        }
+
+        Ok(OcrClassificationRun {
+            patch_count: patches.len(),
+            executed_patches,
+            predictions,
+            outputs,
+        })
+    }
 }
 
 #[cfg(feature = "onnx-runtime")]
@@ -2259,6 +2818,13 @@ impl LocalOcrBackend for LocalOnnxRuntimeBackend {
 
     fn run_detection(&self, page: &OcrPreparedPage) -> anyhow::Result<OcrDetectionResult> {
         Self::run_detection(self, page)
+    }
+
+    fn run_classification(
+        &self,
+        patches: &[OcrRecognitionPatch],
+    ) -> anyhow::Result<OcrClassificationRun> {
+        Self::run_classification(self, patches)
     }
 
     fn run_recognition(
@@ -2291,6 +2857,15 @@ impl LocalOnnxRuntimeBackend {
         )
     }
 
+    fn run_classification(
+        &self,
+        _patches: &[OcrRecognitionPatch],
+    ) -> anyhow::Result<OcrClassificationRun> {
+        anyhow::bail!(
+            "local ONNX OCR requires the `onnx-runtime` cargo feature to be enabled at build time"
+        )
+    }
+
     fn run_recognition(
         &self,
         _patches: &[OcrRecognitionPatch],
@@ -2312,6 +2887,13 @@ impl LocalOcrBackend for LocalOnnxRuntimeBackend {
         Self::run_detection(self, page)
     }
 
+    fn run_classification(
+        &self,
+        patches: &[OcrRecognitionPatch],
+    ) -> anyhow::Result<OcrClassificationRun> {
+        Self::run_classification(self, patches)
+    }
+
     fn run_recognition(
         &self,
         patches: &[OcrRecognitionPatch],
@@ -2323,6 +2905,10 @@ impl LocalOcrBackend for LocalOnnxRuntimeBackend {
 
 #[derive(Debug, Deserialize)]
 struct WorkerOcrResponse {
+    #[serde(default)]
+    pages: Vec<RawOcrPage>,
+    #[serde(default)]
+    blocks: Vec<RawOcrBlock>,
     #[serde(default)]
     lines: Vec<RawOcrLine>,
     provider: Option<String>,
@@ -2444,7 +3030,10 @@ mod tests {
                 provider_name: "secondary-ocr",
                 transport_name: "http",
                 output: OcrOutput {
+                    pages: vec![],
+                    blocks: vec![],
                     lines: vec![OcrLine {
+                        block_id: None,
                         text: "岗位类型：回退成功".to_string(),
                         page_no: Some(1),
                         bbox: None,
@@ -2681,6 +3270,57 @@ mod tests {
     }
 
     #[test]
+    fn decodes_classification_logits_into_rotation() {
+        let output = OcrTensorOutput {
+            name: "cls".to_string(),
+            shape: vec![1, 2],
+            values: vec![0.2, 0.9],
+        };
+
+        let (rotation_degrees, confidence) =
+            decode_classification_output(&output).expect("decode classification");
+
+        assert_eq!(rotation_degrees, 180.0);
+        assert!(confidence > 0.8);
+    }
+
+    #[test]
+    fn applies_classification_rotation_to_recognition_patches() {
+        let patches = vec![OcrRecognitionPatch {
+            bbox: BBox {
+                x1: 0.0,
+                y1: 0.0,
+                x2: 2.0,
+                y2: 2.0,
+            },
+            width: 2,
+            height: 2,
+            channels: 1,
+            rotation_degrees: 0.0,
+            chw_f32: vec![1.0, 2.0, 3.0, 4.0],
+        }];
+        let classification = OcrClassificationRun {
+            patch_count: 1,
+            executed_patches: 1,
+            predictions: vec![OcrClassificationPrediction {
+                patch_index: 0,
+                rotation_degrees: 180.0,
+                confidence: 0.99,
+            }],
+            outputs: Vec::new(),
+        };
+
+        let rotated =
+            apply_classification_to_patches(&patches, &classification).expect("rotate patches");
+
+        assert_eq!(rotated.len(), 1);
+        assert_eq!(rotated[0].width, 2);
+        assert_eq!(rotated[0].height, 2);
+        assert_eq!(rotated[0].rotation_degrees, 180.0);
+        assert_eq!(rotated[0].chw_f32, vec![4.0, 3.0, 2.0, 1.0]);
+    }
+
+    #[test]
     fn fixture_driven_local_onnx_pipeline_regression() {
         let raw = fs::read_to_string("fixtures/ocr/local_onnx_pipeline_fixture.json")
             .expect("read fixture");
@@ -2783,14 +3423,23 @@ mod tests {
     fn normalize_adapter_discards_blank_lines_and_invalid_page_numbers() {
         let output = NormalizeOcrResultAdapter
             .adapt(RawOcrOutput {
+                pages: vec![RawOcrPage {
+                    page_no: 0,
+                    width: Some(0.0),
+                    height: Some(100.0),
+                    rotation_degrees: None,
+                }],
+                blocks: vec![],
                 lines: vec![
                     RawOcrLine {
+                        block_id: None,
                         text: "  岗位类型：图像策略  ".to_string(),
                         page_no: Some(0),
                         bbox: None,
                         confidence: Some(0.9),
                     },
                     RawOcrLine {
+                        block_id: None,
                         text: "  ".to_string(),
                         page_no: Some(1),
                         bbox: None,
@@ -2802,10 +3451,76 @@ mod tests {
             })
             .expect("normalized output");
 
+        assert!(output.pages.is_empty());
+        assert_eq!(output.blocks.len(), 1);
+        assert_eq!(output.blocks[0].block_id, "ocr-b1");
+        assert_eq!(output.blocks[0].line_count, Some(1));
         assert_eq!(output.lines.len(), 1);
+        assert_eq!(output.lines[0].block_id.as_deref(), Some("ocr-b1"));
         assert_eq!(output.lines[0].text, "岗位类型：图像策略");
         assert_eq!(output.lines[0].page_no, None);
         assert_eq!(output.provider.as_deref(), Some("worker"));
+    }
+
+    #[test]
+    fn normalize_adapter_preserves_structured_blocks_and_line_links() {
+        let output = NormalizeOcrResultAdapter
+            .adapt(RawOcrOutput {
+                pages: vec![],
+                blocks: vec![RawOcrBlock {
+                    block_id: Some("ocr-block-1".to_string()),
+                    text: "岗位类型：图像策略\n人设要点：信息密度高".to_string(),
+                    page_no: Some(1),
+                    bbox: Some(BBox {
+                        x1: 10.0,
+                        y1: 20.0,
+                        x2: 120.0,
+                        y2: 80.0,
+                    }),
+                    confidence: Some(0.92),
+                    line_count: None,
+                }],
+                lines: vec![
+                    RawOcrLine {
+                        block_id: Some("ocr-block-1".to_string()),
+                        text: "岗位类型：图像策略".to_string(),
+                        page_no: Some(1),
+                        bbox: Some(BBox {
+                            x1: 10.0,
+                            y1: 20.0,
+                            x2: 120.0,
+                            y2: 48.0,
+                        }),
+                        confidence: Some(0.91),
+                    },
+                    RawOcrLine {
+                        block_id: Some("ocr-block-1".to_string()),
+                        text: "人设要点：信息密度高".to_string(),
+                        page_no: Some(1),
+                        bbox: Some(BBox {
+                            x1: 10.0,
+                            y1: 52.0,
+                            x2: 120.0,
+                            y2: 80.0,
+                        }),
+                        confidence: Some(0.89),
+                    },
+                ],
+                provider: Some("worker".to_string()),
+                model: Some("structured".to_string()),
+            })
+            .expect("normalized output");
+
+        assert_eq!(output.blocks.len(), 1);
+        assert_eq!(output.blocks[0].block_id, "ocr-block-1");
+        assert_eq!(output.blocks[0].line_count, Some(2));
+        assert_eq!(output.lines.len(), 2);
+        assert!(
+            output
+                .lines
+                .iter()
+                .all(|line| line.block_id.as_deref() == Some("ocr-block-1"))
+        );
     }
 
     #[tokio::test]
@@ -2893,6 +3608,23 @@ mod tests {
                         },
                     ],
                 },
+                classification: OcrClassificationRun {
+                    patch_count: 4,
+                    executed_patches: 4,
+                    predictions: vec![
+                        OcrClassificationPrediction {
+                            patch_index: 0,
+                            rotation_degrees: 180.0,
+                            confidence: 0.91,
+                        },
+                        OcrClassificationPrediction {
+                            patch_index: 1,
+                            rotation_degrees: 180.0,
+                            confidence: 0.87,
+                        },
+                    ],
+                    outputs: Vec::new(),
+                },
                 recognition: OcrRecognitionRun {
                     patch_count: 4,
                     executed_patches: 4,
@@ -2935,6 +3667,9 @@ mod tests {
                     page_no: 1,
                     mime_type: Some("image/png".to_string()),
                     bytes: vec![1, 2, 3],
+                    width: Some(100.0),
+                    height: Some(50.0),
+                    rotation_degrees: None,
                     raster: Some(OcrPreparedRaster {
                         original_width: 100,
                         original_height: 50,
@@ -2956,6 +3691,9 @@ mod tests {
             output.model.as_deref(),
             Some("det=/tmp/det.onnx, rec=/tmp/rec.onnx, charset=/tmp/keys.txt")
         );
+        assert_eq!(output.pages.len(), 1);
+        assert_eq!(output.pages[0].page_no, 1);
+        assert_eq!(output.pages[0].rotation_degrees, Some(180.0));
         assert_eq!(output.lines.len(), 3);
         assert_eq!(output.lines[0].text, "岗位类型");
         assert_eq!(output.lines[0].page_no, Some(1));
@@ -3051,10 +3789,15 @@ mod tests {
 
         assert_eq!(output.provider.as_deref(), Some("rapidocr-worker"));
         assert_eq!(output.model.as_deref(), Some("rapidocr-onnx"));
+        assert_eq!(output.blocks.len(), 2);
+        assert_eq!(output.blocks[0].block_id, "ocr-http-b1");
+        assert_eq!(output.blocks[0].line_count, Some(1));
         assert_eq!(output.lines.len(), 2);
         assert_eq!(output.lines[0].text, "岗位类型：图像策略");
+        assert_eq!(output.lines[0].block_id.as_deref(), Some("ocr-http-b1"));
         assert_eq!(output.lines[0].page_no, Some(1));
         assert!(output.lines[0].bbox.is_some());
+        assert_eq!(output.lines[1].block_id.as_deref(), Some("ocr-http-b2"));
 
         server.abort();
     }
@@ -3117,10 +3860,14 @@ mod tests {
         Json(json!({
             "provider": "rapidocr-worker",
             "model": "rapidocr-onnx",
+            "blocks": [
+                {"block_id": "ocr-http-b1", "text": "岗位类型：图像策略", "page_no": 1, "bbox": {"x1": 10.0, "y1": 20.0, "x2": 110.0, "y2": 44.0}, "confidence": 0.98, "line_count": 1},
+                {"block_id": "ocr-http-b2", "text": "人设要点：边缘预处理", "page_no": 1, "bbox": {"x1": 12.0, "y1": 60.0, "x2": 160.0, "y2": 84.0}, "confidence": 0.93, "line_count": 1}
+            ],
             "lines": [
-                {"text": "岗位类型：图像策略", "page_no": 1, "bbox": {"x1": 10.0, "y1": 20.0, "x2": 110.0, "y2": 44.0}, "confidence": 0.98},
+                {"block_id": "ocr-http-b1", "text": "岗位类型：图像策略", "page_no": 1, "bbox": {"x1": 10.0, "y1": 20.0, "x2": 110.0, "y2": 44.0}, "confidence": 0.98},
                 {"text": "  ", "confidence": 0.2},
-                {"text": "人设要点：边缘预处理", "page_no": 1, "bbox": {"x1": 12.0, "y1": 60.0, "x2": 160.0, "y2": 84.0}, "confidence": 0.93}
+                {"block_id": "ocr-http-b2", "text": "人设要点：边缘预处理", "page_no": 1, "bbox": {"x1": 12.0, "y1": 60.0, "x2": 160.0, "y2": 84.0}, "confidence": 0.93}
             ]
         }))
     }

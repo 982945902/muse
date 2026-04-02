@@ -1,0 +1,35 @@
+{
+  "asset": {
+    "asset_id": "scanned_upload_pdf"
+  },
+  "expected_source_type": "pdf",
+  "expected_plain_text_contains": [
+    "第一页结果",
+    "第二页结果"
+  ],
+  "expected_page_count": 2,
+  "expected_first_block_text": "第一页结果",
+  "expected_parser_provider": "pdf-parser",
+  "expected_metadata": [
+    {
+      "key": "pdf_provider",
+      "value": "test-raster-scan-pdf"
+    },
+    {
+      "key": "pdf_parse_mode",
+      "value": "ocr_fallback"
+    },
+    {
+      "key": "pdf_ocr_input",
+      "value": "page_rasters"
+    },
+    {
+      "key": "pdf_raster_provider",
+      "value": "test-inline-rasterizer"
+    },
+    {
+      "key": "ocr_provider",
+      "value": "raster-aware-ocr"
+    }
+  ]
+}

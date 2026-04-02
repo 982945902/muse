@@ -1,0 +1,24 @@
+{
+  "asset": {
+    "asset_id": "text_layer_upload_pdf"
+  },
+  "schema": {
+    "name": "text-layer-pdf-demo",
+    "version": "1",
+    "fields": [
+      {
+        "key": "role_type",
+        "field_type": "string",
+        "required": false,
+        "multiple": false,
+        "children": [],
+        "hints": []
+      }
+    ]
+  },
+  "expected_raw_text": "role_type: pdf text",
+  "expected_field_key": "role_type",
+  "expected_field_value": "pdf text",
+  "expected_evidence_page_nos": [1],
+  "expected_page_ocr_done": null
+}

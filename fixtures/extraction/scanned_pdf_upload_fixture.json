@@ -1,4 +1,7 @@
 {
+  "asset": {
+    "asset_id": "scanned_upload_pdf"
+  },
   "schema": {
     "name": "scan-demo",
     "version": "1",
@@ -21,6 +24,9 @@
     "pdf_ocr_input": "page_rasters",
     "pdf_raster_provider": "test-inline-rasterizer",
     "ocr_provider": "raster-aware-ocr",
-    "ocr_transport": "inproc"
+    "ocr_transport": "inproc",
+    "width": 1242.0,
+    "height": 1660.0,
+    "rotation_degrees": null
   }
 }

@@ -1,0 +1,40 @@
+{
+  "assets": [
+    {
+      "id": "image_upload_green",
+      "asset_path": "fixtures/assets/images/image_upload_green.png",
+      "file_name": "poster.png",
+      "content_type": "image/png"
+    },
+    {
+      "id": "pdf_page_red",
+      "asset_path": "fixtures/assets/images/pdf_page_red.png",
+      "file_name": "pdf-page-red.png",
+      "content_type": "image/png"
+    },
+    {
+      "id": "pdf_page_blue",
+      "asset_path": "fixtures/assets/images/pdf_page_blue.png",
+      "file_name": "pdf-page-blue.png",
+      "content_type": "image/png"
+    },
+    {
+      "id": "scanned_upload_pdf",
+      "asset_path": "fixtures/assets/pdfs/scanned_upload_fixture.pdf",
+      "file_name": "scan.pdf",
+      "content_type": "application/pdf"
+    },
+    {
+      "id": "text_layer_upload_pdf",
+      "asset_path": "fixtures/assets/pdfs/text_layer_upload_fixture.pdf",
+      "file_name": "text-layer.pdf",
+      "content_type": "application/pdf"
+    },
+    {
+      "id": "profile_upload_docx",
+      "asset_path": "fixtures/assets/docx/profile_upload_fixture.docx",
+      "file_name": "profile.docx",
+      "content_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    }
+  ]
+}

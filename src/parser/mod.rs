@@ -91,14 +91,21 @@ mod tests {
     use crate::docx::{DocxOutput, DocxProvider, DocxRequest};
     use crate::domain::{BBox, SourceType};
     use crate::ocr::{
-        LocalOnnxOcrProvider, OcrLine, OcrOutput, OcrProvider, OcrRequest, TestLocalOcrCandidate,
-        TestLocalOcrFixture, TestLocalOcrPrediction,
+        LocalOnnxOcrProvider, OcrLine, OcrOutput, OcrPage, OcrProvider, OcrRequest,
+        TestLocalOcrCandidate, TestLocalOcrClassification, TestLocalOcrFixture,
+        TestLocalOcrPrediction,
     };
     use crate::pdf::{PdfOcrPage, PdfOutput, PdfProvider, PdfRequest};
+    use crate::test_support::fixtures::{
+        FixtureAssetRef, load_asset_bytes, load_fixture_bytes as read_fixture_bytes,
+        load_json_fixture, resolve_fixture_asset,
+    };
     use ::image::{ColorType, GenericImageView, ImageEncoder, codecs::png::PngEncoder};
     use async_trait::async_trait;
+    use serde::Deserialize;
 
     struct TestOcrProvider;
+    struct FixtureImageOcrProvider;
     struct RasterAwareOcrProvider;
     struct TestPdfProvider;
     struct TestScanPdfProvider;
@@ -114,8 +121,43 @@ mod tests {
 
         async fn recognize(&self, _request: OcrRequest) -> anyhow::Result<OcrOutput> {
             Ok(OcrOutput {
+                pages: vec![OcrPage {
+                    page_no: 1,
+                    width: Some(1242.0),
+                    height: Some(1660.0),
+                    rotation_degrees: None,
+                }],
+                blocks: vec![
+                    crate::ocr::OcrBlock {
+                        block_id: "test-ocr-block-1".to_string(),
+                        text: "岗位类型：图片运营".to_string(),
+                        page_no: Some(1),
+                        bbox: Some(BBox {
+                            x1: 10.0,
+                            y1: 20.0,
+                            x2: 120.0,
+                            y2: 48.0,
+                        }),
+                        confidence: Some(0.9),
+                        line_count: Some(1),
+                    },
+                    crate::ocr::OcrBlock {
+                        block_id: "test-ocr-block-2".to_string(),
+                        text: "人设要点：审美好".to_string(),
+                        page_no: Some(1),
+                        bbox: Some(BBox {
+                            x1: 12.0,
+                            y1: 60.0,
+                            x2: 150.0,
+                            y2: 90.0,
+                        }),
+                        confidence: Some(0.8),
+                        line_count: Some(1),
+                    },
+                ],
                 lines: vec![
                     OcrLine {
+                        block_id: Some("test-ocr-block-1".to_string()),
                         text: "岗位类型：图片运营".to_string(),
                         page_no: Some(1),
                         bbox: Some(BBox {
@@ -127,6 +169,7 @@ mod tests {
                         confidence: Some(0.9),
                     },
                     OcrLine {
+                        block_id: Some("test-ocr-block-2".to_string()),
                         text: "人设要点：审美好".to_string(),
                         page_no: Some(1),
                         bbox: Some(BBox {
@@ -140,6 +183,79 @@ mod tests {
                 ],
                 provider: None,
                 model: Some("test-ocr-model".to_string()),
+            })
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ParserRegressionFixture {
+        asset: FixtureAssetRef,
+        expected_source_type: String,
+        expected_plain_text_contains: Vec<String>,
+        expected_page_count: usize,
+        expected_first_block_text: String,
+        expected_parser_provider: String,
+        expected_metadata: Vec<MetadataExpectation>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct MetadataExpectation {
+        key: String,
+        value: String,
+    }
+
+    #[async_trait]
+    impl OcrProvider for FixtureImageOcrProvider {
+        fn name(&self) -> &'static str {
+            "fixture-image-ocr"
+        }
+
+        fn transport_name(&self) -> &'static str {
+            "inproc"
+        }
+
+        async fn recognize(&self, request: OcrRequest) -> anyhow::Result<OcrOutput> {
+            assert_eq!(request.mime_type.as_deref(), Some("image/png"));
+            let image = ::image::load_from_memory(&request.bytes).expect("decode png");
+            assert!(image.width() >= 1000);
+            assert!(image.height() >= 1000);
+
+            Ok(OcrOutput {
+                pages: vec![OcrPage {
+                    page_no: 1,
+                    width: Some(image.width() as f32),
+                    height: Some(image.height() as f32),
+                    rotation_degrees: None,
+                }],
+                blocks: vec![],
+                lines: vec![
+                    OcrLine {
+                        block_id: None,
+                        text: "岗位类型：图片运营".to_string(),
+                        page_no: Some(1),
+                        bbox: Some(BBox {
+                            x1: 124.0,
+                            y1: 320.0,
+                            x2: 840.0,
+                            y2: 398.0,
+                        }),
+                        confidence: Some(0.97),
+                    },
+                    OcrLine {
+                        block_id: None,
+                        text: "人设要点：审美好、节奏感强".to_string(),
+                        page_no: Some(1),
+                        bbox: Some(BBox {
+                            x1: 124.0,
+                            y1: 470.0,
+                            x2: 980.0,
+                            y2: 548.0,
+                        }),
+                        confidence: Some(0.95),
+                    },
+                ],
+                provider: Some("fixture-image-ocr".to_string()),
+                model: Some("fixture-image-model".to_string()),
             })
         }
     }
@@ -163,7 +279,15 @@ mod tests {
             };
 
             Ok(OcrOutput {
+                pages: vec![OcrPage {
+                    page_no: 1,
+                    width: Some(image.width() as f32),
+                    height: Some(image.height() as f32),
+                    rotation_degrees: None,
+                }],
+                blocks: vec![],
                 lines: vec![OcrLine {
+                    block_id: None,
                     text: text.to_string(),
                     page_no: Some(1),
                     bbox: Some(BBox {
@@ -217,7 +341,7 @@ mod tests {
                 raster_pages: vec![PdfOcrPage {
                     page_no: 1,
                     mime_type: Some("image/png".to_string()),
-                    bytes: encode_test_png(2, 1, &[255, 255, 255, 0, 0, 0]),
+                    bytes: load_asset_bytes("image_upload_green"),
                 }],
             })
         }
@@ -240,12 +364,12 @@ mod tests {
                     PdfOcrPage {
                         page_no: 1,
                         mime_type: Some("image/png".to_string()),
-                        bytes: encode_test_png(1, 1, &[255, 0, 0]),
+                        bytes: load_asset_bytes("pdf_page_red"),
                     },
                     PdfOcrPage {
                         page_no: 2,
                         mime_type: Some("image/png".to_string()),
-                        bytes: encode_test_png(1, 1, &[0, 0, 255]),
+                        bytes: load_asset_bytes("pdf_page_blue"),
                     },
                 ],
             })
@@ -269,12 +393,12 @@ mod tests {
                     PdfOcrPage {
                         page_no: 1,
                         mime_type: Some("image/png".to_string()),
-                        bytes: encode_test_png(1, 1, &[255, 0, 0]),
+                        bytes: load_asset_bytes("pdf_page_red"),
                     },
                     PdfOcrPage {
                         page_no: 1,
                         mime_type: Some("image/png".to_string()),
-                        bytes: encode_test_png(1, 1, &[0, 0, 255]),
+                        bytes: load_asset_bytes("pdf_page_blue"),
                     },
                 ],
             })
@@ -357,7 +481,7 @@ mod tests {
         let input = ParseInput::from_upload(
             "resume.pdf".to_string(),
             Some("application/pdf".to_string()),
-            b"%PDF-1.7".to_vec(),
+            load_asset_bytes("scanned_upload_pdf"),
         );
 
         let document = parser.parse(input).await.expect("parse should succeed");
@@ -420,7 +544,7 @@ mod tests {
         let input = ParseInput::from_upload(
             "poster.png".to_string(),
             Some("image/png".to_string()),
-            vec![1, 2, 3, 4],
+            load_asset_bytes("image_upload_green"),
         );
 
         let document = parser.parse(input).await.expect("parse should succeed");
@@ -454,8 +578,28 @@ mod tests {
             document.metadata.extra.get("ocr_model").map(String::as_str),
             Some("test-ocr-model")
         );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_page_1_line_count")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_page_1_block_count")
+                .map(String::as_str),
+            Some("2")
+        );
         assert_eq!(document.pages.len(), 1);
+        assert_eq!(document.pages[0].width, Some(1242.0));
+        assert_eq!(document.pages[0].height, Some(1660.0));
         assert_eq!(document.pages[0].blocks.len(), 2);
+        assert_eq!(document.pages[0].blocks[0].block_id, "test-ocr-block-1");
+        assert_eq!(document.pages[0].blocks[1].block_id, "test-ocr-block-2");
         assert_eq!(document.pages[0].blocks[0].text, "岗位类型：图片运营");
         assert_eq!(document.pages[0].blocks[1].text, "人设要点：审美好");
         assert!(document.pages[0].blocks[0].bbox.is_some());
@@ -468,8 +612,9 @@ mod tests {
         let parser = DefaultParser::new(
             Arc::new(LocalOnnxOcrProvider::from_test_fixture(
                 TestLocalOcrFixture {
-                    model_summary: "det=/tmp/det.onnx, rec=/tmp/rec.onnx, charset=/tmp/keys.txt"
-                        .to_string(),
+                    model_summary:
+                        "det=/tmp/det.onnx, rec=/tmp/rec.onnx, cls=/tmp/cls.onnx, charset=/tmp/keys.txt"
+                            .to_string(),
                     charset: vec!["岗".to_string(), "位".to_string(), "类".to_string()],
                     candidates: vec![
                         TestLocalOcrCandidate {
@@ -489,6 +634,18 @@ mod tests {
                                 y2: 104.0,
                             },
                             score: 0.84,
+                        },
+                    ],
+                    classifications: vec![
+                        TestLocalOcrClassification {
+                            patch_index: 0,
+                            rotation_degrees: 180.0,
+                            confidence: 0.94,
+                        },
+                        TestLocalOcrClassification {
+                            patch_index: 1,
+                            rotation_degrees: 180.0,
+                            confidence: 0.89,
                         },
                     ],
                     predictions: vec![
@@ -542,9 +699,35 @@ mod tests {
         );
         assert_eq!(
             document.metadata.extra.get("ocr_model").map(String::as_str),
-            Some("det=/tmp/det.onnx, rec=/tmp/rec.onnx, charset=/tmp/keys.txt")
+            Some("det=/tmp/det.onnx, rec=/tmp/rec.onnx, cls=/tmp/cls.onnx, charset=/tmp/keys.txt")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_page_1_line_count")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_page_1_block_count")
+                .map(String::as_str),
+            Some("2")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_page_1_rotation_degrees")
+                .map(String::as_str),
+            Some("180")
         );
         assert_eq!(document.pages.len(), 1);
+        assert_eq!(document.pages[0].width, Some(4.0));
+        assert_eq!(document.pages[0].height, Some(2.0));
         assert_eq!(document.pages[0].blocks.len(), 2);
         assert_eq!(document.pages[0].blocks[0].text, "岗位类型");
         assert_eq!(document.pages[0].blocks[1].text, "人设要点");
@@ -565,7 +748,7 @@ mod tests {
         let input = ParseInput::from_upload(
             "scan.pdf".to_string(),
             Some("application/pdf".to_string()),
-            b"%PDF-1.7 scanned".to_vec(),
+            load_asset_bytes("scanned_upload_pdf"),
         );
 
         let document = parser.parse(input).await.expect("parse should succeed");
@@ -646,7 +829,7 @@ mod tests {
         let input = ParseInput::from_upload(
             "scan-pages.pdf".to_string(),
             Some("application/pdf".to_string()),
-            b"%PDF-1.7 scan pages".to_vec(),
+            load_asset_bytes("scanned_upload_pdf"),
         );
 
         let document = parser.parse(input).await.expect("parse should succeed");
@@ -655,6 +838,10 @@ mod tests {
         assert_eq!(document.pages.len(), 2);
         assert_eq!(document.pages[0].page_no, 1);
         assert_eq!(document.pages[1].page_no, 2);
+        assert_eq!(document.pages[0].width, Some(1242.0));
+        assert_eq!(document.pages[0].height, Some(1660.0));
+        assert_eq!(document.pages[1].width, Some(1242.0));
+        assert_eq!(document.pages[1].height, Some(1660.0));
         assert_eq!(document.pages[0].blocks.len(), 1);
         assert_eq!(document.pages[1].blocks.len(), 1);
         assert_eq!(document.pages[0].blocks[0].text, "第一页结果");
@@ -699,7 +886,7 @@ mod tests {
         let input = ParseInput::from_upload(
             "scan-invalid.pdf".to_string(),
             Some("application/pdf".to_string()),
-            b"%PDF-1.7 invalid scan pages".to_vec(),
+            load_asset_bytes("scanned_upload_pdf"),
         );
 
         let error = parser.parse(input).await.expect_err("parse should fail");
@@ -711,7 +898,7 @@ mod tests {
         let parser = DefaultParser::new(
             Arc::new(TestOcrProvider),
             Arc::new(TestPdfProvider),
-            Arc::new(TestDocxProvider),
+            Arc::new(crate::docx::ZipDocxProvider),
         );
         let input = ParseInput::from_upload(
             "resume.docx".to_string(),
@@ -719,7 +906,7 @@ mod tests {
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
                     .to_string(),
             ),
-            vec![0, 1, 2, 3],
+            load_asset_bytes("profile_upload_docx"),
         );
 
         let document = parser.parse(input).await.expect("parse should succeed");
@@ -742,7 +929,7 @@ mod tests {
                 .extra
                 .get("docx_provider")
                 .map(String::as_str),
-            Some("test-docx")
+            Some("zip-docx")
         );
         assert_eq!(
             document
@@ -750,9 +937,117 @@ mod tests {
                 .extra
                 .get("paragraph_count")
                 .map(String::as_str),
-            Some("4")
+            Some("2")
         );
         assert!(document.plain_text.contains("岗位类型：文档运营"));
+    }
+
+    #[tokio::test]
+    async fn parser_fixture_image_asset_regression() {
+        let fixture = load_parser_regression_fixture("fixtures/parser/image_parser_fixture.json");
+        let parser = DefaultParser::new(
+            Arc::new(FixtureImageOcrProvider),
+            Arc::new(TestPdfProvider),
+            Arc::new(crate::docx::ZipDocxProvider),
+        );
+
+        run_parser_regression_fixture(parser, fixture).await;
+    }
+
+    #[tokio::test]
+    async fn parser_fixture_scanned_pdf_asset_regression() {
+        let fixture =
+            load_parser_regression_fixture("fixtures/parser/scanned_pdf_parser_fixture.json");
+        let parser = DefaultParser::new(
+            Arc::new(RasterAwareOcrProvider),
+            Arc::new(TestRasterScanPdfProvider),
+            Arc::new(crate::docx::ZipDocxProvider),
+        );
+
+        run_parser_regression_fixture(parser, fixture).await;
+    }
+
+    #[tokio::test]
+    async fn parser_fixture_docx_asset_regression() {
+        let fixture = load_parser_regression_fixture("fixtures/parser/docx_parser_fixture.json");
+        let parser = DefaultParser::new(
+            Arc::new(FixtureImageOcrProvider),
+            Arc::new(TestPdfProvider),
+            Arc::new(crate::docx::ZipDocxProvider),
+        );
+
+        run_parser_regression_fixture(parser, fixture).await;
+    }
+
+    #[tokio::test]
+    async fn parser_fixture_text_layer_pdf_asset_regression() {
+        let fixture =
+            load_parser_regression_fixture("fixtures/parser/text_layer_pdf_parser_fixture.json");
+        let parser = DefaultParser::new(
+            Arc::new(FixtureImageOcrProvider),
+            Arc::new(crate::pdf::LopdfTextLayerProvider),
+            Arc::new(crate::docx::ZipDocxProvider),
+        );
+
+        run_parser_regression_fixture(parser, fixture).await;
+    }
+
+    fn load_fixture_bytes(path: &str) -> Vec<u8> {
+        read_fixture_bytes(path)
+    }
+
+    fn load_parser_regression_fixture(path: &str) -> ParserRegressionFixture {
+        load_json_fixture(path)
+    }
+
+    async fn run_parser_regression_fixture(
+        parser: DefaultParser,
+        fixture: ParserRegressionFixture,
+    ) {
+        let asset = resolve_fixture_asset(&fixture.asset);
+        let input = ParseInput::from_upload(
+            asset.file_name,
+            Some(asset.content_type),
+            load_fixture_bytes(&asset.asset_path),
+        );
+
+        let document = parser.parse(input).await.expect("parse should succeed");
+
+        assert_eq!(
+            format!("{:?}", document.source_type).to_lowercase(),
+            fixture.expected_source_type
+        );
+        assert_eq!(document.pages.len(), fixture.expected_page_count);
+        assert_eq!(
+            document.pages[0].blocks[0].text,
+            fixture.expected_first_block_text
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("parser_provider")
+                .map(String::as_str),
+            Some(fixture.expected_parser_provider.as_str())
+        );
+        for expected in fixture.expected_plain_text_contains {
+            assert!(
+                document.plain_text.contains(&expected),
+                "plain_text should contain `{expected}`"
+            );
+        }
+        for expected in fixture.expected_metadata {
+            assert_eq!(
+                document
+                    .metadata
+                    .extra
+                    .get(&expected.key)
+                    .map(String::as_str),
+                Some(expected.value.as_str()),
+                "metadata mismatch for key `{}`",
+                expected.key
+            );
+        }
     }
 
     fn encode_test_png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {

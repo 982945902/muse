@@ -46,20 +46,78 @@ impl Parser for ImageParser {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let blocks = ocr_output
-            .lines
-            .iter()
-            .map(|line| shared::BlockInput {
-                text: line.text.clone(),
-                page_no: line.page_no.unwrap_or(1),
-                bbox: line.bbox.clone(),
-                confidence: line.confidence,
-            })
-            .collect::<Vec<_>>();
+        let blocks = if !ocr_output.blocks.is_empty() {
+            ocr_output
+                .blocks
+                .iter()
+                .map(|block| shared::BlockInput {
+                    block_id: Some(block.block_id.clone()),
+                    text: block.text.clone(),
+                    page_no: block.page_no.unwrap_or(1),
+                    bbox: block.bbox.clone(),
+                    confidence: block.confidence,
+                })
+                .collect::<Vec<_>>()
+        } else {
+            ocr_output
+                .lines
+                .iter()
+                .map(|line| shared::BlockInput {
+                    block_id: line.block_id.clone(),
+                    text: line.text.clone(),
+                    page_no: line.page_no.unwrap_or(1),
+                    bbox: line.bbox.clone(),
+                    confidence: line.confidence,
+                })
+                .collect::<Vec<_>>()
+        };
         let mut document =
             shared::build_document_from_blocks(input, blocks, BlockSourceKind::Ocr, self.name());
         if document.plain_text.trim().is_empty() {
             document.plain_text = text;
+        }
+        for page in &mut document.pages {
+            if let Some(ocr_page) = ocr_output
+                .pages
+                .iter()
+                .find(|ocr_page| ocr_page.page_no == page.page_no)
+            {
+                page.width = ocr_page.width;
+                page.height = ocr_page.height;
+                if let Some(rotation) = ocr_page.rotation_degrees {
+                    document.metadata.extra.insert(
+                        format!("ocr_page_{}_rotation_degrees", page.page_no),
+                        rotation.to_string(),
+                    );
+                }
+            }
+            let page_no = page.page_no;
+            document.metadata.extra.insert(
+                format!("ocr_page_{}_line_count", page_no),
+                ocr_output
+                    .lines
+                    .iter()
+                    .filter(|line| line.page_no.unwrap_or(1) == page_no)
+                    .count()
+                    .to_string(),
+            );
+            document.metadata.extra.insert(
+                format!("ocr_page_{}_block_count", page_no),
+                if ocr_output.blocks.is_empty() {
+                    ocr_output
+                        .lines
+                        .iter()
+                        .filter(|line| line.page_no.unwrap_or(1) == page_no)
+                        .count()
+                } else {
+                    ocr_output
+                        .blocks
+                        .iter()
+                        .filter(|block| block.page_no.unwrap_or(1) == page_no)
+                        .count()
+                }
+                .to_string(),
+            );
         }
         document.metadata.extra.insert(
             "ocr_provider".to_string(),

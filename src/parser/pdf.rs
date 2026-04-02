@@ -1,8 +1,8 @@
 use super::{Parser, shared};
 use crate::{
-    domain::BlockSourceKind,
+    domain::{BlockSourceKind, PageIr},
     ingestion::ParseInput,
-    ocr::{OcrLine, OcrOutput, OcrProvider, OcrRequest},
+    ocr::{OcrLine, OcrOutput, OcrPage, OcrProvider, OcrRequest},
     pdf::{PdfOcrPage, PdfProvider, PdfRequest},
 };
 use async_trait::async_trait;
@@ -63,21 +63,42 @@ impl Parser for PdfParser {
                 )
             };
 
-            let blocks = ocr_output
-                .lines
-                .iter()
-                .map(|line| shared::BlockInput {
-                    text: line.text.clone(),
-                    page_no: line.page_no.unwrap_or(1),
-                    bbox: line.bbox.clone(),
-                    confidence: line.confidence,
-                })
-                .collect::<Vec<_>>();
+            let blocks = if !ocr_output.blocks.is_empty() {
+                ocr_output
+                    .blocks
+                    .iter()
+                    .map(|block| shared::BlockInput {
+                        block_id: Some(block.block_id.clone()),
+                        text: block.text.clone(),
+                        page_no: block.page_no.unwrap_or(1),
+                        bbox: block.bbox.clone(),
+                        confidence: block.confidence,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                ocr_output
+                    .lines
+                    .iter()
+                    .map(|line| shared::BlockInput {
+                        block_id: line.block_id.clone(),
+                        text: line.text.clone(),
+                        page_no: line.page_no.unwrap_or(1),
+                        bbox: line.bbox.clone(),
+                        confidence: line.confidence,
+                    })
+                    .collect::<Vec<_>>()
+            };
             let mut document = shared::build_document_from_blocks(
                 input,
                 blocks,
                 BlockSourceKind::Ocr,
                 self.name(),
+            );
+            apply_ocr_page_metadata(
+                &mut document.pages,
+                &ocr_output,
+                &ocr_output.pages,
+                &mut document.metadata.extra,
             );
             if document.plain_text.trim().is_empty() {
                 document.plain_text = ocr_output
@@ -98,6 +119,7 @@ impl Parser for PdfParser {
                     page_text
                         .lines()
                         .map(|line| shared::BlockInput {
+                            block_id: None,
                             text: line.to_string(),
                             page_no: (index + 1) as u32,
                             bbox: None,
@@ -204,6 +226,8 @@ impl PdfParser {
         raster_pages: &[PdfOcrPage],
     ) -> anyhow::Result<OcrOutput> {
         let mut lines = Vec::new();
+        let mut blocks = Vec::new();
+        let mut pages = Vec::new();
         let mut provider = None;
         let mut model = None;
 
@@ -224,18 +248,99 @@ impl PdfParser {
                 model = output.model.clone();
             }
 
+            if let Some(page) = output.pages.first() {
+                pages.push(OcrPage {
+                    page_no: raster_page.page_no.max(1),
+                    width: page.width,
+                    height: page.height,
+                    rotation_degrees: page.rotation_degrees,
+                });
+            } else {
+                pages.push(OcrPage {
+                    page_no: raster_page.page_no.max(1),
+                    width: image::load_from_memory(&raster_page.bytes)
+                        .ok()
+                        .map(|image| image.width() as f32),
+                    height: image::load_from_memory(&raster_page.bytes)
+                        .ok()
+                        .map(|image| image.height() as f32),
+                    rotation_degrees: None,
+                });
+            }
+
             lines.extend(output.lines.into_iter().map(|line| OcrLine {
+                block_id: line.block_id,
                 text: line.text,
                 page_no: Some(raster_page.page_no.max(1)),
                 bbox: line.bbox,
                 confidence: line.confidence,
             }));
+            blocks.extend(output.blocks.into_iter().map(|block| crate::ocr::OcrBlock {
+                block_id: block.block_id,
+                text: block.text,
+                page_no: Some(raster_page.page_no.max(1)),
+                bbox: block.bbox,
+                confidence: block.confidence,
+                line_count: block.line_count,
+            }));
         }
 
         Ok(OcrOutput {
+            pages,
+            blocks,
             lines,
             provider,
             model,
         })
+    }
+}
+
+fn apply_ocr_page_metadata(
+    pages: &mut [PageIr],
+    ocr_output: &OcrOutput,
+    ocr_pages: &[OcrPage],
+    metadata: &mut std::collections::HashMap<String, String>,
+) {
+    for page in pages {
+        let page_no = page.page_no;
+        if let Some(ocr_page) = ocr_pages
+            .iter()
+            .find(|ocr_page| ocr_page.page_no == page_no)
+        {
+            page.width = ocr_page.width;
+            page.height = ocr_page.height;
+            if let Some(rotation) = ocr_page.rotation_degrees {
+                metadata.insert(
+                    format!("ocr_page_{}_rotation_degrees", page_no),
+                    rotation.to_string(),
+                );
+            }
+        }
+        metadata.insert(
+            format!("ocr_page_{}_line_count", page_no),
+            ocr_output
+                .lines
+                .iter()
+                .filter(|line| line.page_no.unwrap_or(1) == page_no)
+                .count()
+                .to_string(),
+        );
+        metadata.insert(
+            format!("ocr_page_{}_block_count", page_no),
+            if ocr_output.blocks.is_empty() {
+                ocr_output
+                    .lines
+                    .iter()
+                    .filter(|line| line.page_no.unwrap_or(1) == page_no)
+                    .count()
+            } else {
+                ocr_output
+                    .blocks
+                    .iter()
+                    .filter(|block| block.page_no.unwrap_or(1) == page_no)
+                    .count()
+            }
+            .to_string(),
+        );
     }
 }

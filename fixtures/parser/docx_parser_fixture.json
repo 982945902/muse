@@ -1,0 +1,23 @@
+{
+  "asset": {
+    "asset_id": "profile_upload_docx"
+  },
+  "expected_source_type": "docx",
+  "expected_plain_text_contains": [
+    "岗位类型：文档运营",
+    "人设要点：结构化表达"
+  ],
+  "expected_page_count": 1,
+  "expected_first_block_text": "岗位类型：文档运营",
+  "expected_parser_provider": "docx-parser",
+  "expected_metadata": [
+    {
+      "key": "docx_provider",
+      "value": "zip-docx"
+    },
+    {
+      "key": "paragraph_count",
+      "value": "2"
+    }
+  ]
+}

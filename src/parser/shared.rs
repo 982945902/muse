@@ -14,6 +14,7 @@ pub fn build_document(
     build_document_from_page_blocks(
         input,
         vec![vec![BlockInput {
+            block_id: None,
             text,
             page_no: 1,
             bbox: None,
@@ -26,6 +27,7 @@ pub fn build_document(
 
 #[derive(Clone, Debug)]
 pub struct BlockInput {
+    pub block_id: Option<String>,
     pub text: String,
     pub page_no: u32,
     pub bbox: Option<BBox>,
@@ -57,7 +59,7 @@ pub fn build_document_from_page_blocks(
                     }
 
                     Some(TextBlock {
-                        block_id: Uuid::new_v4().to_string(),
+                        block_id: block_id_or_uuid(block.block_id),
                         page_no: block.page_no.max(1),
                         text,
                         bbox: block.bbox,
@@ -97,6 +99,10 @@ pub fn build_document_from_page_blocks(
             extra,
         },
     }
+}
+
+fn block_id_or_uuid(block_id: Option<String>) -> String {
+    block_id.unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
 pub fn build_document_from_blocks(

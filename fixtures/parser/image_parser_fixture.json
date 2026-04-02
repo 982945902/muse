@@ -1,0 +1,27 @@
+{
+  "asset": {
+    "asset_id": "image_upload_green"
+  },
+  "expected_source_type": "image",
+  "expected_plain_text_contains": [
+    "岗位类型：图片运营",
+    "人设要点：审美好、节奏感强"
+  ],
+  "expected_page_count": 1,
+  "expected_first_block_text": "岗位类型：图片运营",
+  "expected_parser_provider": "image-parser",
+  "expected_metadata": [
+    {
+      "key": "ocr_provider",
+      "value": "fixture-image-ocr"
+    },
+    {
+      "key": "ocr_transport",
+      "value": "inproc"
+    },
+    {
+      "key": "ocr_model",
+      "value": "fixture-image-model"
+    }
+  ]
+}

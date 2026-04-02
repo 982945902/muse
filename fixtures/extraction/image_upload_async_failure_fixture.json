@@ -1,4 +1,8 @@
 {
+  "asset": {
+    "asset_id": "image_upload_green",
+    "file_name": "broken.png"
+  },
   "schema": {
     "name": "image-demo-failure",
     "version": "1",

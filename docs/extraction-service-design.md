@@ -37,7 +37,7 @@
 
 距离“生产可用”最关键的缺口有四个：
 
-1. 本地 OCR 已具备 MVP，但真实模型质量回归、classification 编排和扫描件端到端验证仍未完成。
+1. 本地 OCR 已具备 MVP，但真实模型质量回归、classification 编排和基于真实 OCR 模型的扫描件端到端验证仍未完成。
 2. storage 和 queue 仍是 in-memory，异步任务不具备真正的持久化恢复能力。
 3. tokenized/UIE ONNX 虽然代码路径已实现，但还缺真实模型集成验证。
 4. 缓存治理、租户隔离、可观测性仍未完成。
@@ -513,6 +513,7 @@ created -> queued -> parsing -> extracting -> postprocessing -> succeeded
 - OCR 输出 `TextBlock[]`。
 - 聚合为 `plain_text`。
 - 再执行 schema 抽取。
+- OCR 契约现在还会尽量携带页级元信息，例如 `page_no / width / height / rotation_degrees`，用于前端标注和扫描页可视化；在 `local-onnx` 路线下，`rotation_degrees` 可来自 classification 输出的页内主方向聚合结果。
 
 SDK 侧优化路径：
 
@@ -649,7 +650,13 @@ pub trait OcrProvider {
 
 - 将不同 OCR 引擎输出统一转换为服务内部 `OcrOutput`。
 - 统一字段至少包括：
+  - `blocks[].block_id`
+  - `blocks[].text`
+  - `blocks[].line_count`
+  - `blocks[].page_no`
+  - `blocks[].bbox`
   - `lines[].text`
+  - `lines[].block_id`
   - `lines[].confidence`
   - `lines[].page_no`
   - `lines[].bbox`
@@ -1140,6 +1147,12 @@ data: {"sequence":1,"event_type":"task.accepted","task_id":"task_123","created_a
 event: stage.changed
 data: {"sequence":2,"event_type":"stage.changed","task_id":"task_123","created_at_ms":1710000000100,"payload":{"stage":"parsing","status":"running"}}
 
+event: page.parsed
+data: {"sequence":3,"event_type":"page.parsed","task_id":"task_123","created_at_ms":1710000000500,"payload":{"page_no":1,"width":1242.0,"height":1660.0,"block_count":12,"text_chars":236}}
+
+event: page.ocr_done
+data: {"sequence":4,"event_type":"page.ocr_done","task_id":"task_123","created_at_ms":1710000000800,"payload":{"page_no":1,"width":1242.0,"height":1660.0,"rotation_degrees":0.0,"ocr_block_count":12,"ocr_line_count":18,"ocr_provider":"local-onnx-ocr","ocr_model":"det=...","ocr_transport":"inproc","ocr_blocks_preview":[{"block_id":"ocr-p1-b1","text":"岗位类型：图像策略","text_chars":8,"bbox":{"x1":10.0,"y1":20.0,"x2":110.0,"y2":44.0},"confidence":0.98}],"pdf_ocr_input":"page_rasters","pdf_raster_provider":"pdftoppm"}}
+
 event: result.snapshot
 data: {"sequence":5,"event_type":"result.snapshot","task_id":"task_123","created_at_ms":1710000001200,"payload":{"cached":false,"field_count":3,"result":{...}}}
 
@@ -1152,6 +1165,10 @@ data: {"sequence":6,"event_type":"completed","task_id":"task_123","created_at_ms
 - 已提供任务级 SSE 事件流骨架。
 - 已接入 `task.accepted / stage.changed / document.ready / page.parsed / page.ocr_done / block.extracted / result.partial / result.snapshot / cache.hit / completed / failed`。
 - `result.partial` 已支持按页面前缀逐步修订，同一字段可随着后续页面继续更新。
+- `page.parsed` 已可携带页级 `width / height`，便于前端先建立页面坐标系。
+- `page.ocr_done` 已可携带 `width / height / rotation_degrees / ocr_block_count / ocr_line_count` 与 OCR provider 元信息，并附带轻量 `ocr_blocks_preview[]`，便于前端直接做 bbox 叠加和 OCR 调试展示。
+- 当前实现里，增量型 `result.partial` 与 `block.extracted` 事件也已可携带页级 `width / height / rotation_degrees`，便于字段高亮直接挂回当前页面。
+- `result.partial` 与 `block.extracted` 当前都可额外携带聚合后的 `bbox` 与去重后的 `bboxes[]`，便于前端直接绘制字段高亮框，而不必自己再做 evidence 框合并。
 
 ### 12.2 查询任务结果
 
@@ -1529,7 +1546,7 @@ src/
 - 已补齐 HTTP OCR worker 成功/失败测试。
 - 已实现 SSE 提取事件流骨架。
 - 已接入 ONNX Runtime CPU provider 的真实字符串 I/O 推理链路与 JSON 结果解码。
-- 本地内置 OCR provider 尚未落地，仍是下一阶段能力。
+- 本地内置 OCR provider 已落地 `local-onnx` MVP，已具备图片前处理、det/cls/rec 基础编排与页级 OCR 元信息透传，但真实模型回归与稳定性验证仍在继续。
 
 ### Phase 3：效果和成本优化
 
@@ -1583,7 +1600,7 @@ src/
 - `http` provider 已可视为真实运行时接入。
 - `placeholder` 仅是开发兜底，不应视为生产 OCR。
 - `local-onnx` 已完成启动配置、模型目录发现、图片解码/缩放/CHW 归一化前处理、ONNX Runtime session bootstrap、detector 输入张量构造与 session run、heatmap 连通域解码、recognition patch 裁片准备、recognition tensor 执行、以及可选预热。
-- `local-onnx` 已可完成 `det + rec + CTC decode` 的基础 OCR 推理，但仍缺真实模型回归与稳定性验证。
+- `local-onnx` 已可完成 `det + cls + rec + CTC decode` 的基础 OCR 推理，并可输出页级 `rotation_degrees`，但仍缺真实模型回归与稳定性验证。
 - `Preprocess Layer` 目前仍较薄，后续应继续从 parser 中抽离并独立治理。
 - PDF 已支持 `CompositePdfProvider` 组合模式：
   - 文本层路径：`lopdf`
@@ -1775,7 +1792,7 @@ ONNX sidecar 约定：
 - `image/pdf/docx/text/url` 原始输入轨道。
 - `NormalizedDocument` 标准化输入轨道与协议校验。
 - 图片 OCR provider 抽象，现支持 `placeholder`、`http` worker 与 `local-onnx bootstrap`。
-- 本地 OCR 已具备统一抽象边界，以及 `local-onnx` 的目录发现、图片前处理、detector 输入张量构造、候选 bbox 解码、recognition patch 准备、recognition tensor 执行、CTC 文本解码、session 启动与预热能力。
+- 本地 OCR 已具备统一抽象边界，以及 `local-onnx` 的目录发现、图片前处理、detector 输入张量构造、候选 bbox 解码、classification patch 旋转编排、recognition patch 准备、recognition tensor 执行、CTC 文本解码、session 启动与预热能力。
 - OCR 内部已按 `Preprocess / Runtime / Result Adapter` 三层拆出 MVP 结构。
 - OCR metadata 已区分 `ocr_provider` 与 `ocr_transport`，`/version` 也已暴露 transport。
 - 已支持 `MUSE_OCR_FALLBACK_PROVIDER`，可在主 OCR provider 失败时自动回退到备用 provider。
@@ -1783,6 +1800,7 @@ ONNX sidecar 约定：
 - 扫描 PDF 已新增 `raster_pages` 契约，parser 会优先对页图逐页 OCR，并在 metadata 中记录 `pdf_ocr_input=page_rasters|original_pdf_bytes`。
 - `/version` 已暴露 `pdf_raster_provider`，扫描 PDF metadata 也可记录 `pdf_raster_provider` 便于排障。
 - `DocumentIR` 页/块颗粒度增强：图片按 OCR 行、PDF 按页、docx 按段落保留结构。
+- OCR 页级元信息已可透传到 `DocumentIR.pages[]` 的 `width/height`，并通过 metadata 与 SSE 事件进一步透传 `rotation_degrees`，可直接用于前端 bbox 叠加与扫描页方向展示。
 - heuristic extractor、基础类型转换、object/array 子字段聚合。
 - ONNX Runtime CPU provider 配置入口、sidecar 约定、字符串 I/O 真推理与 JSON 输出解码。
 - tokenized/UIE ONNX 路线的基础代码路径已经具备：
@@ -1795,6 +1813,7 @@ ONNX sidecar 约定：
 - postprocess 字段清洗、evidence 去重、结果归一化。
 - in-memory task store 与带 `hit_count` 的结果缓存。
 - SSE 事件流骨架、`stream_url` 返回、逐页修订的 `result.partial`、`page.ocr_done` 与 `block.extracted` 事件。
+- 已引入共享 fixture asset manifest，统一管理 `fixtures/assets/{images,pdfs,docx}` 真实样本、文件名和 MIME 信息，避免 parser/API 回归样例重复维护。
 
 ## 25. TODO
 
@@ -1834,7 +1853,7 @@ ONNX sidecar 约定：
 
 1. `Image Preprocess Layer`：负责缩放、归一化、旋转纠正、必要的页图切分。
 2. `Local Runtime Layer`：负责 ONNX Runtime 或本地 C++ OCR 引擎生命周期、模型加载、线程数与预热。
-3. `Result Adapter Layer`：负责把 OCR 检测/识别结果映射为统一 `OcrLine[]`，并附带 `page_no / bbox / confidence`。
+3. `Result Adapter Layer`：负责把 OCR 检测/识别结果映射为统一 `OcrBlock[] + OcrLine[]`，并附带 `block_id / page_no / bbox / confidence`。
 
 建议新增 provider：
 
@@ -1859,6 +1878,7 @@ pub struct LocalOnnxOcrProvider {
 - 已完成图片解码、限边长缩放与 RGB->CHW 浮点张量前处理。
 - 已完成 detector 的输入张量拼装与单输入 session run。
 - 已完成 detector heatmap 的连通域解码，并可回映射到原图 bbox。
+- 已完成 classification session bootstrap、分类输出解码与基于 patch 的 0/90/180/270 旋转编排主路径。
 - 已完成 bbox 到 recognition patch 的基础裁片与缩放准备。
 - 已完成 recognition session 的单 patch 张量执行与输出摘要。
 - 已完成基于 charset sidecar 的 CTC greedy 文本解码主路径。
@@ -1872,14 +1892,17 @@ pub struct LocalOnnxOcrProvider {
 - 已为扫描 PDF 补充 `raster_pages` 输入契约与逐页 OCR 聚合逻辑，并有集成测试覆盖多页页号回填。
 - 已补充上传接口级扫描 PDF 集成测试，覆盖 `multipart upload -> parser -> OCR -> extractor -> response` 主链路。
 - 已补充 `CompositePdfProvider` 单测，覆盖“有文本层不栅格化 / 无文本层走 rasterizer”两条路径。
-- 已新增 fixture 驱动的扫描 PDF、图片上传成功回归、图片上传缓存命中回归、同步 OCR 失败回归，以及异步 OCR 失败、异步 PDF raster 失败回归样例，开始建立可扩展的 golden regression 基线。
+- 已新增 fixture 驱动的扫描 PDF、文本层 PDF、图片、docx 上传成功回归、图片上传缓存命中回归、同步 OCR 失败回归，以及异步 OCR 失败、异步 PDF raster 失败回归样例，开始建立可扩展的 golden regression 基线。
+- 上传回归已不再只依赖测试内联生成 bytes，仓库中已加入真实 `fixtures/assets/{images,pdfs,docx}` 样本资产，便于排查和后续扩展真实样本基线。
+- 已新增共享 `fixtures/assets/manifest.json` 与测试辅助加载器，统一 parser/API 两套 fixture 对真实资产的引用方式，减少 `asset_path / file_name / content_type` 的重复声明。
+- parser 层也已补充 fixture 驱动的真实 `image / scanned pdf / text-layer pdf / docx` 样本回归，开始把 `asset -> parser -> DocumentIR` 单独固定下来。
 - 同步执行失败现在也会落任务失败状态并发布失败事件，便于和异步路径保持一致的排障语义。
 
 当前未完成：
 
-- classification 的真实推理编排。
+- classification 的真实模型验证与稳健性回归。
 - 围绕真实模型样本的识别质量回归与解码稳健性验证。
-- 真实图片或扫描 PDF 的端到端集成回归。
+- 基于真实 OCR 模型而非 stub/provider 的真实图片或扫描 PDF 端到端集成回归。
 
 落地要点：
 

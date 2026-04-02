@@ -1,4 +1,7 @@
 {
+  "asset": {
+    "asset_id": "image_upload_green"
+  },
   "schema": {
     "name": "image-demo",
     "version": "1",
@@ -21,6 +24,9 @@
     "pdf_ocr_input": null,
     "pdf_raster_provider": null,
     "ocr_provider": "raster-aware-ocr",
-    "ocr_transport": "inproc"
+    "ocr_transport": "inproc",
+    "width": 1242.0,
+    "height": 1660.0,
+    "rotation_degrees": null
   }
 }

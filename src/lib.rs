@@ -13,3 +13,5 @@ pub mod postprocess;
 pub mod queue;
 pub mod storage;
 pub mod telemetry;
+#[cfg(test)]
+pub mod test_support;

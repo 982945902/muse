@@ -1,8 +1,8 @@
 use crate::{
     app::AppState,
     domain::{
-        DocumentIr, Evidence, ExtractionResult, FieldValue, NormalizedDocument, SchemaSpec,
-        TaskRecord, TaskStatus,
+        BlockSourceKind, DocumentIr, DocumentMetadata, Evidence, ExtractionResult, FieldValue,
+        NormalizedDocument, PageIr, SchemaSpec, TaskRecord, TaskStatus,
     },
     events::StreamEvent,
     ingestion::{ExtractionInput, ParseInput},
@@ -599,8 +599,18 @@ async fn publish_partial_field_events(
     cached: bool,
 ) {
     for (index, field) in result.fields.iter().enumerate() {
-        publish_partial_field_event(state, task_id, field, index + 1, cached, None, None, None)
-            .await;
+        publish_partial_field_event(
+            state,
+            task_id,
+            field,
+            index + 1,
+            cached,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
     }
 }
 
@@ -613,11 +623,16 @@ async fn publish_partial_field_event(
     page_no: Option<u32>,
     pages_processed: Option<usize>,
     page_count: Option<usize>,
+    page_context: Option<PageEventContext>,
 ) {
+    let bboxes = collect_event_bboxes(&field.evidences);
+    let bbox = merge_bboxes(&bboxes);
     let mut payload = serde_json::json!({
         "cached": cached,
         "revision": revision,
         "field": field,
+        "bbox": bbox,
+        "bboxes": bboxes,
     });
 
     if let Some(page_no) = page_no {
@@ -628,6 +643,11 @@ async fn publish_partial_field_event(
     }
     if let Some(page_count) = page_count {
         payload["page_count"] = serde_json::json!(page_count);
+    }
+    if let Some(page_context) = page_context {
+        payload["width"] = serde_json::json!(page_context.width);
+        payload["height"] = serde_json::json!(page_context.height);
+        payload["rotation_degrees"] = serde_json::json!(page_context.rotation_degrees);
     }
 
     publish_event(state, task_id, "result.partial", payload).await;
@@ -640,6 +660,7 @@ async fn publish_block_extracted_event(
     revision: usize,
     page_no: u32,
     new_evidences: &[Evidence],
+    page_context: Option<PageEventContext>,
 ) {
     if new_evidences.is_empty() {
         return;
@@ -657,6 +678,8 @@ async fn publish_block_extracted_event(
         .collect::<std::collections::BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
+    let bboxes = collect_event_bboxes(new_evidences);
+    let bbox = merge_bboxes(&bboxes);
 
     publish_event(
         state,
@@ -670,6 +693,11 @@ async fn publish_block_extracted_event(
             "evidence_count": new_evidences.len(),
             "source_block_ids": source_block_ids,
             "snippets": snippets,
+            "bbox": bbox,
+            "bboxes": bboxes,
+            "width": page_context.as_ref().and_then(|context| context.width),
+            "height": page_context.as_ref().and_then(|context| context.height),
+            "rotation_degrees": page_context.and_then(|context| context.rotation_degrees),
         }),
     )
     .await;
@@ -695,6 +723,8 @@ async fn publish_document_events(state: &Arc<AppState>, task_id: &str, document:
             "page.parsed",
             serde_json::json!({
                 "page_no": page.page_no,
+                "width": page.width,
+                "height": page.height,
                 "block_count": page.blocks.len(),
                 "text_chars": page.blocks.iter().map(|block| block.text.chars().count()).sum::<usize>(),
             }),
@@ -713,10 +743,24 @@ async fn publish_document_events(state: &Arc<AppState>, task_id: &str, document:
                 "page.ocr_done",
                 serde_json::json!({
                     "page_no": page.page_no,
-                    "ocr_block_count": ocr_block_count,
+                    "width": page.width,
+                    "height": page.height,
+                    "rotation_degrees": lookup_ocr_page_rotation_degrees(&document.metadata, page.page_no),
+                    "ocr_block_count": lookup_ocr_page_usize_metric(
+                        &document.metadata,
+                        page.page_no,
+                        "block_count",
+                    )
+                    .unwrap_or(ocr_block_count),
+                    "ocr_line_count": lookup_ocr_page_usize_metric(
+                        &document.metadata,
+                        page.page_no,
+                        "line_count",
+                    ),
                     "ocr_provider": document.metadata.extra.get("ocr_provider"),
                     "ocr_model": document.metadata.extra.get("ocr_model"),
                     "ocr_transport": document.metadata.extra.get("ocr_transport"),
+                    "ocr_blocks_preview": build_ocr_blocks_preview(page),
                     "pdf_ocr_input": document.metadata.extra.get("pdf_ocr_input"),
                     "pdf_raster_provider": document.metadata.extra.get("pdf_raster_provider"),
                 }),
@@ -724,6 +768,106 @@ async fn publish_document_events(state: &Arc<AppState>, task_id: &str, document:
             .await;
         }
     }
+}
+
+fn lookup_ocr_page_rotation_degrees(metadata: &DocumentMetadata, page_no: u32) -> Option<f32> {
+    metadata
+        .extra
+        .get(&format!("ocr_page_{}_rotation_degrees", page_no))
+        .and_then(|value| value.parse::<f32>().ok())
+}
+
+fn lookup_ocr_page_usize_metric(
+    metadata: &DocumentMetadata,
+    page_no: u32,
+    metric: &str,
+) -> Option<usize> {
+    metadata
+        .extra
+        .get(&format!("ocr_page_{}_{}", page_no, metric))
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn build_ocr_blocks_preview(page: &PageIr) -> Vec<serde_json::Value> {
+    const OCR_BLOCKS_PREVIEW_LIMIT: usize = 5;
+    const OCR_BLOCK_TEXT_PREVIEW_CHARS: usize = 80;
+
+    page.blocks
+        .iter()
+        .filter(|block| matches!(block.source_kind, BlockSourceKind::Ocr))
+        .take(OCR_BLOCKS_PREVIEW_LIMIT)
+        .map(|block| {
+            serde_json::json!({
+                "block_id": block.block_id,
+                "text": truncate_preview_text(&block.text, OCR_BLOCK_TEXT_PREVIEW_CHARS),
+                "text_chars": block.text.chars().count(),
+                "bbox": block.bbox,
+                "confidence": block.confidence,
+            })
+        })
+        .collect()
+}
+
+fn truncate_preview_text(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+
+    let mut chars = text.chars();
+    let preview = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
+fn collect_event_bboxes(evidences: &[Evidence]) -> Vec<crate::domain::BBox> {
+    let mut collected = Vec::new();
+
+    for bbox in evidences
+        .iter()
+        .filter_map(|evidence| evidence.bbox.clone())
+    {
+        if !collected.iter().any(|existing| existing == &bbox) {
+            collected.push(bbox);
+        }
+    }
+
+    collected
+}
+
+fn merge_bboxes(bboxes: &[crate::domain::BBox]) -> Option<crate::domain::BBox> {
+    let first = bboxes.first()?;
+    let mut merged = first.clone();
+
+    for bbox in &bboxes[1..] {
+        merged.x1 = merged.x1.min(bbox.x1);
+        merged.y1 = merged.y1.min(bbox.y1);
+        merged.x2 = merged.x2.max(bbox.x2);
+        merged.y2 = merged.y2.max(bbox.y2);
+    }
+
+    Some(merged)
+}
+
+#[derive(Clone, Copy)]
+struct PageEventContext {
+    width: Option<f32>,
+    height: Option<f32>,
+    rotation_degrees: Option<f32>,
+}
+
+fn lookup_page_event_context(document: &DocumentIr, page_no: u32) -> Option<PageEventContext> {
+    document
+        .pages
+        .iter()
+        .find(|page| page.page_no == page_no)
+        .map(|page| PageEventContext {
+            width: page.width,
+            height: page.height,
+            rotation_degrees: lookup_ocr_page_rotation_degrees(&document.metadata, page_no),
+        })
 }
 
 async fn publish_completion_event(
@@ -862,6 +1006,7 @@ async fn publish_incremental_result_events(
     state: &Arc<AppState>,
     task_id: &str,
     tracker: &mut PartialResultTracker,
+    document: &DocumentIr,
     result: &ExtractionResult,
     options: &ExtractionOptions,
     page_no: u32,
@@ -870,6 +1015,7 @@ async fn publish_incremental_result_events(
 ) {
     for delta in collect_partial_field_deltas(tracker, &result.fields) {
         let response_field = sanitize_field_for_response(&delta.field, options);
+        let page_context = lookup_page_event_context(document, page_no);
         publish_partial_field_event(
             state,
             task_id,
@@ -879,6 +1025,7 @@ async fn publish_incremental_result_events(
             Some(page_no),
             Some(pages_processed),
             Some(page_count),
+            page_context,
         )
         .await;
         publish_block_extracted_event(
@@ -888,6 +1035,7 @@ async fn publish_incremental_result_events(
             delta.revision,
             page_no,
             &delta.new_evidences,
+            page_context,
         )
         .await;
     }
@@ -1100,6 +1248,7 @@ async fn execute_document_extraction(
             &state,
             &task_id,
             &mut partial_tracker,
+            partial_document,
             &pass.result,
             &options,
             page_no,
@@ -1371,29 +1520,35 @@ mod tests {
             BBox, BlockSourceKind, DocumentMetadata, Evidence, FieldValue, NormalizedPage,
             NormalizedTextBlock, PageIr, SourceType, TextBlock,
         },
-        ocr::{OcrLine, OcrOutput, OcrProvider, OcrRequest},
+        ocr::{OcrLine, OcrOutput, OcrPage, OcrProvider, OcrRequest},
         pdf::{PdfOcrPage, PdfOutput, PdfProvider, PdfRequest},
+        test_support::fixtures::{
+            FixtureAssetRef, load_asset_bytes, load_fixture_bytes, load_json_fixture,
+            resolve_fixture_asset,
+        },
     };
-    use ::image::{ColorType, GenericImageView, ImageEncoder, codecs::png::PngEncoder};
+    use ::image::GenericImageView;
     use async_trait::async_trait;
     use axum::{body::Body, http::Request};
     use serde::Deserialize;
     use serde_json::json;
-    use std::{fs, sync::Arc};
+    use std::sync::Arc;
     use tower::util::ServiceExt;
 
     struct RasterAwareOcrProvider;
+    struct RotatingImageOcrProvider;
     struct RasterScanPdfProvider;
     struct FailingOcrProvider;
 
     #[derive(Debug, Deserialize)]
     struct UploadRegressionFixture {
+        asset: FixtureAssetRef,
         schema: SchemaSpec,
         expected_raw_text: String,
         expected_field_key: String,
         expected_field_value: serde_json::Value,
         expected_evidence_page_nos: Vec<u32>,
-        expected_page_ocr_done: UploadRegressionEventExpectation,
+        expected_page_ocr_done: Option<UploadRegressionEventExpectation>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -1402,10 +1557,14 @@ mod tests {
         pdf_raster_provider: serde_json::Value,
         ocr_provider: serde_json::Value,
         ocr_transport: serde_json::Value,
+        width: serde_json::Value,
+        height: serde_json::Value,
+        rotation_degrees: serde_json::Value,
     }
 
     #[derive(Debug, Deserialize)]
     struct UploadFailureRegressionFixture {
+        asset: FixtureAssetRef,
         schema: SchemaSpec,
         expected_http_status: u16,
         expected_error_contains: String,
@@ -1414,6 +1573,7 @@ mod tests {
 
     #[derive(Debug, Deserialize)]
     struct UploadSyncFailureRegressionFixture {
+        asset: FixtureAssetRef,
         schema: SchemaSpec,
         expected_http_status: u16,
         expected_error_contains: String,
@@ -1423,6 +1583,7 @@ mod tests {
 
     #[derive(Debug, Deserialize)]
     struct UploadCacheHitRegressionFixture {
+        asset: FixtureAssetRef,
         schema: SchemaSpec,
         expected_raw_text: String,
         expected_field_key: String,
@@ -1470,7 +1631,15 @@ mod tests {
             };
 
             Ok(OcrOutput {
+                pages: vec![OcrPage {
+                    page_no: 1,
+                    width: Some(image.width() as f32),
+                    height: Some(image.height() as f32),
+                    rotation_degrees: None,
+                }],
+                blocks: vec![],
                 lines: vec![OcrLine {
+                    block_id: None,
                     text: text.to_string(),
                     page_no: Some(1),
                     bbox: Some(BBox {
@@ -1503,6 +1672,46 @@ mod tests {
     }
 
     #[async_trait]
+    impl OcrProvider for RotatingImageOcrProvider {
+        fn name(&self) -> &'static str {
+            "rotating-image-ocr"
+        }
+
+        fn transport_name(&self) -> &'static str {
+            "inproc"
+        }
+
+        async fn recognize(&self, request: OcrRequest) -> anyhow::Result<OcrOutput> {
+            assert_eq!(request.mime_type.as_deref(), Some("image/png"));
+            let image = ::image::load_from_memory(&request.bytes).expect("decode png");
+
+            Ok(OcrOutput {
+                pages: vec![OcrPage {
+                    page_no: 1,
+                    width: Some(image.width() as f32),
+                    height: Some(image.height() as f32),
+                    rotation_degrees: Some(270.0),
+                }],
+                blocks: vec![],
+                lines: vec![OcrLine {
+                    block_id: None,
+                    text: "岗位类型：图片运营".to_string(),
+                    page_no: Some(1),
+                    bbox: Some(BBox {
+                        x1: 124.0,
+                        y1: 320.0,
+                        x2: 840.0,
+                        y2: 398.0,
+                    }),
+                    confidence: Some(0.98),
+                }],
+                provider: Some("rotating-image-ocr".to_string()),
+                model: Some("rotating-image-model".to_string()),
+            })
+        }
+    }
+
+    #[async_trait]
     impl PdfProvider for RasterScanPdfProvider {
         fn name(&self) -> &'static str {
             "test-raster-scan-pdf"
@@ -1519,12 +1728,12 @@ mod tests {
                     PdfOcrPage {
                         page_no: 1,
                         mime_type: Some("image/png".to_string()),
-                        bytes: encode_test_png(1, 1, &[255, 0, 0]),
+                        bytes: load_asset_bytes("pdf_page_red"),
                     },
                     PdfOcrPage {
                         page_no: 2,
                         mime_type: Some("image/png".to_string()),
-                        bytes: encode_test_png(1, 1, &[0, 0, 255]),
+                        bytes: load_asset_bytes("pdf_page_blue"),
                     },
                 ],
             })
@@ -1712,17 +1921,7 @@ mod tests {
             Arc::new(ZipDocxProvider),
         ));
         let router = app::build_router((*state).clone());
-        let boundary = "muse-boundary";
-        run_upload_regression_fixture(
-            router,
-            state,
-            fixture,
-            "scan.pdf",
-            "application/pdf",
-            b"%PDF-1.7 fake scanned".to_vec(),
-            boundary,
-        )
-        .await;
+        run_upload_regression_fixture(router, state, fixture, "muse-boundary").await;
     }
 
     #[tokio::test]
@@ -1736,16 +1935,121 @@ mod tests {
         ));
         let router = app::build_router((*state).clone());
 
-        run_upload_regression_fixture(
+        run_upload_regression_fixture(router, state, fixture, "muse-image-boundary").await;
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_emits_image_rotation_metadata_in_page_ocr_done_event() {
+        let state = Arc::new(test_state_with_providers(
+            Arc::new(RotatingImageOcrProvider),
+            Arc::new(RasterScanPdfProvider),
+            Arc::new(ZipDocxProvider),
+        ));
+        let router = app::build_router((*state).clone());
+        let asset = resolve_fixture_asset(&FixtureAssetRef {
+            asset_id: "image_upload_green".to_string(),
+            file_name: None,
+            content_type: None,
+        });
+        let schema = SchemaSpec {
+            name: "image-rotation-regression".to_string(),
+            version: "1".to_string(),
+            fields: vec![crate::domain::FieldSpec {
+                key: "岗位类型".to_string(),
+                field_type: crate::domain::FieldType::String,
+                required: false,
+                multiple: false,
+                children: vec![],
+                hints: vec![],
+            }],
+        };
+
+        let payload = send_standard_upload_request(
             router,
-            state,
-            fixture,
-            "poster.png",
-            "image/png",
-            encode_test_png(1, 1, &[0, 255, 0]),
-            "muse-image-boundary",
+            "sync",
+            &schema,
+            &asset.file_name,
+            &asset.content_type,
+            load_fixture_bytes(&asset.asset_path),
+            "muse-image-rotation-boundary",
         )
         .await;
+
+        assert_eq!(payload.status, StatusCode::OK);
+        let task_id = payload
+            .payload
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("task id");
+
+        let subscription = state.events.subscribe(task_id).await.expect("subscription");
+        let page_ocr_done = subscription
+            .history
+            .iter()
+            .find(|event| event.event_type == "page.ocr_done")
+            .expect("page.ocr_done event");
+
+        assert_eq!(
+            page_ocr_done.payload.get("ocr_provider"),
+            Some(&json!("rotating-image-ocr"))
+        );
+        assert_eq!(
+            page_ocr_done.payload.get("ocr_transport"),
+            Some(&json!("inproc"))
+        );
+        assert_eq!(
+            page_ocr_done.payload.get("rotation_degrees"),
+            Some(&json!(270.0))
+        );
+        assert_eq!(
+            page_ocr_done.payload.get("ocr_block_count"),
+            Some(&json!(1))
+        );
+        assert_eq!(page_ocr_done.payload.get("ocr_line_count"), Some(&json!(1)));
+        assert_eq!(page_ocr_done.payload.get("width"), Some(&json!(1242.0)));
+        assert_eq!(page_ocr_done.payload.get("height"), Some(&json!(1660.0)));
+        let preview = page_ocr_done
+            .payload
+            .get("ocr_blocks_preview")
+            .and_then(serde_json::Value::as_array)
+            .expect("ocr_blocks_preview");
+        assert_eq!(preview.len(), 1);
+        assert!(
+            preview[0]
+                .get("block_id")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        );
+        assert_eq!(preview[0].get("text"), Some(&json!("岗位类型：图片运营")));
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_extracts_docx_via_fixture_regression() {
+        let fixture =
+            load_upload_regression_fixture("fixtures/extraction/docx_upload_fixture.json");
+        let state = Arc::new(test_state_with_providers(
+            Arc::new(RasterAwareOcrProvider),
+            Arc::new(RasterScanPdfProvider),
+            Arc::new(ZipDocxProvider),
+        ));
+        let router = app::build_router((*state).clone());
+
+        run_upload_regression_fixture(router, state, fixture, "muse-docx-boundary").await;
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_extracts_text_layer_pdf_via_fixture_regression() {
+        let fixture = load_upload_regression_fixture(
+            "fixtures/extraction/text_layer_pdf_upload_fixture.json",
+        );
+        let state = Arc::new(test_state_with_providers(
+            Arc::new(RasterAwareOcrProvider),
+            Arc::new(crate::pdf::LopdfTextLayerProvider),
+            Arc::new(ZipDocxProvider),
+        ));
+        let router = app::build_router((*state).clone());
+
+        run_upload_regression_fixture(router, state, fixture, "muse-text-layer-pdf-boundary").await;
     }
 
     #[tokio::test]
@@ -1764,9 +2068,6 @@ mod tests {
             router,
             state,
             fixture,
-            "poster.png",
-            "image/png",
-            encode_test_png(1, 1, &[0, 255, 0]),
             "muse-image-cache-boundary",
         )
         .await;
@@ -1788,9 +2089,6 @@ mod tests {
             router,
             state,
             fixture,
-            "broken.png",
-            "image/png",
-            encode_test_png(1, 1, &[0, 255, 0]),
             "muse-image-sync-failure-boundary",
         )
         .await;
@@ -1808,6 +2106,7 @@ mod tests {
         ));
         let router = app::build_router((*state).clone());
         let boundary = "muse-image-failure-boundary";
+        let asset = resolve_fixture_asset(&fixture.asset);
         let payload = send_upload_request(
             router.clone(),
             boundary,
@@ -1819,9 +2118,9 @@ mod tests {
                 ),
                 multipart_file_part(
                     "file",
-                    "broken.png",
-                    "image/png",
-                    encode_test_png(1, 1, &[0, 255, 0]),
+                    &asset.file_name,
+                    &asset.content_type,
+                    load_fixture_bytes(&asset.asset_path),
                 ),
             ],
         )
@@ -1903,6 +2202,7 @@ mod tests {
         let state = Arc::new(app::build_state(&config));
         let router = app::build_router((*state).clone());
         let boundary = "muse-pdf-raster-failure-boundary";
+        let asset = resolve_fixture_asset(&fixture.asset);
         let payload = send_upload_request(
             router.clone(),
             boundary,
@@ -1912,7 +2212,12 @@ mod tests {
                     "schema",
                     &serde_json::to_string(&fixture.schema).expect("schema json"),
                 ),
-                multipart_file_part("file", "scan.pdf", "application/pdf", build_blank_pdf()),
+                multipart_file_part(
+                    "file",
+                    &asset.file_name,
+                    &asset.content_type,
+                    load_fixture_bytes(&asset.asset_path),
+                ),
             ],
         )
         .await;
@@ -2004,6 +2309,9 @@ mod tests {
             "pdf_raster_provider".to_string(),
             "pdftoppm-rasterizer".to_string(),
         );
+        metadata
+            .extra
+            .insert("ocr_page_1_rotation_degrees".to_string(), "90".to_string());
 
         publish_document_events(
             &state,
@@ -2013,8 +2321,8 @@ mod tests {
                 source_type: SourceType::Pdf,
                 pages: vec![PageIr {
                     page_no: 1,
-                    width: None,
-                    height: None,
+                    width: Some(1242.0),
+                    height: Some(1660.0),
                     blocks: vec![TextBlock {
                         block_id: "b1".to_string(),
                         page_no: 1,
@@ -2047,6 +2355,26 @@ mod tests {
                 "pdftoppm-rasterizer".to_string()
             ))
         );
+        assert_eq!(
+            page_ocr_done.payload.get("width"),
+            Some(&serde_json::json!(1242.0))
+        );
+        assert_eq!(
+            page_ocr_done.payload.get("height"),
+            Some(&serde_json::json!(1660.0))
+        );
+        assert_eq!(
+            page_ocr_done.payload.get("rotation_degrees"),
+            Some(&serde_json::json!(90.0))
+        );
+        let preview = page_ocr_done
+            .payload
+            .get("ocr_blocks_preview")
+            .and_then(serde_json::Value::as_array)
+            .expect("ocr_blocks_preview");
+        assert_eq!(preview.len(), 1);
+        assert_eq!(preview[0].get("block_id"), Some(&json!("b1")));
+        assert_eq!(preview[0].get("text"), Some(&json!("岗位类型：扫描件")));
     }
 
     fn test_router() -> Router {
@@ -2128,100 +2456,38 @@ mod tests {
         body
     }
 
-    fn encode_test_png(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        let encoder = PngEncoder::new(&mut bytes);
-        encoder
-            .write_image(rgb, width, height, ColorType::Rgb8.into())
-            .expect("encode png");
-        bytes
-    }
-
-    fn build_blank_pdf() -> Vec<u8> {
-        use lopdf::{
-            Document, Object, Stream,
-            content::{Content, Operation},
-            dictionary,
-        };
-
-        let mut document = Document::with_version("1.5");
-        let pages_id = document.new_object_id();
-        let page_id = document.new_object_id();
-        let resources_id = document.add_object(dictionary! {});
-        let content = Content {
-            operations: vec![Operation::new("BT", vec![]), Operation::new("ET", vec![])],
-        };
-        let content_id = document.add_object(Stream::new(
-            dictionary! {},
-            content.encode().expect("encode content"),
-        ));
-
-        let page = dictionary! {
-            "Type" => "Page",
-            "Parent" => pages_id,
-            "Contents" => content_id,
-            "Resources" => resources_id,
-            "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()],
-        };
-        document.objects.insert(page_id, Object::Dictionary(page));
-
-        let pages = dictionary! {
-            "Type" => "Pages",
-            "Kids" => vec![page_id.into()],
-            "Count" => 1,
-        };
-        document.objects.insert(pages_id, Object::Dictionary(pages));
-
-        let catalog_id = document.add_object(dictionary! {
-            "Type" => "Catalog",
-            "Pages" => pages_id,
-        });
-        document.trailer.set("Root", catalog_id);
-        document.compress();
-
-        let mut buffer = Vec::new();
-        document.save_to(&mut buffer).expect("save pdf");
-        buffer
-    }
-
     fn load_upload_regression_fixture(path: &str) -> UploadRegressionFixture {
-        let raw = fs::read_to_string(path).expect("read upload fixture");
-        serde_json::from_str(&raw).expect("parse upload fixture")
+        load_json_fixture(path)
     }
 
     fn load_upload_failure_regression_fixture(path: &str) -> UploadFailureRegressionFixture {
-        let raw = fs::read_to_string(path).expect("read upload failure fixture");
-        serde_json::from_str(&raw).expect("parse upload failure fixture")
+        load_json_fixture(path)
     }
 
     fn load_upload_sync_failure_regression_fixture(
         path: &str,
     ) -> UploadSyncFailureRegressionFixture {
-        let raw = fs::read_to_string(path).expect("read upload sync failure fixture");
-        serde_json::from_str(&raw).expect("parse upload sync failure fixture")
+        load_json_fixture(path)
     }
 
     fn load_upload_cache_hit_regression_fixture(path: &str) -> UploadCacheHitRegressionFixture {
-        let raw = fs::read_to_string(path).expect("read upload cache-hit fixture");
-        serde_json::from_str(&raw).expect("parse upload cache-hit fixture")
+        load_json_fixture(path)
     }
 
     async fn run_upload_regression_fixture(
         router: Router,
         state: Arc<app::AppState>,
         fixture: UploadRegressionFixture,
-        file_name: &str,
-        content_type: &str,
-        file_bytes: Vec<u8>,
         boundary: &str,
     ) {
+        let asset = resolve_fixture_asset(&fixture.asset);
         let payload = send_standard_upload_request(
             router.clone(),
             "sync",
             &fixture.schema,
-            file_name,
-            content_type,
-            file_bytes,
+            &asset.file_name,
+            &asset.content_type,
+            load_fixture_bytes(&asset.asset_path),
             boundary,
         )
         .await;
@@ -2256,44 +2522,49 @@ mod tests {
         let page_ocr_done = subscription
             .history
             .iter()
-            .find(|event| event.event_type == "page.ocr_done")
-            .expect("page.ocr_done event");
-        assert_eq!(
-            page_ocr_done.payload.get("pdf_ocr_input"),
-            Some(&fixture.expected_page_ocr_done.pdf_ocr_input)
-        );
-        assert_eq!(
-            page_ocr_done.payload.get("pdf_raster_provider"),
-            Some(&fixture.expected_page_ocr_done.pdf_raster_provider)
-        );
-        assert_eq!(
-            page_ocr_done.payload.get("ocr_provider"),
-            Some(&fixture.expected_page_ocr_done.ocr_provider)
-        );
-        assert_eq!(
-            page_ocr_done.payload.get("ocr_transport"),
-            Some(&fixture.expected_page_ocr_done.ocr_transport)
-        );
+            .find(|event| event.event_type == "page.ocr_done");
+        match fixture.expected_page_ocr_done {
+            Some(expected) => {
+                let page_ocr_done = page_ocr_done.expect("page.ocr_done event");
+                assert_eq!(
+                    page_ocr_done.payload.get("pdf_ocr_input"),
+                    Some(&expected.pdf_ocr_input)
+                );
+                assert_eq!(
+                    page_ocr_done.payload.get("pdf_raster_provider"),
+                    Some(&expected.pdf_raster_provider)
+                );
+                assert_eq!(
+                    page_ocr_done.payload.get("ocr_provider"),
+                    Some(&expected.ocr_provider)
+                );
+                assert_eq!(
+                    page_ocr_done.payload.get("ocr_transport"),
+                    Some(&expected.ocr_transport)
+                );
+                assert_eq!(page_ocr_done.payload.get("width"), Some(&expected.width));
+                assert_eq!(page_ocr_done.payload.get("height"), Some(&expected.height));
+                assert_eq!(
+                    page_ocr_done.payload.get("rotation_degrees"),
+                    Some(&expected.rotation_degrees)
+                );
+            }
+            None => {
+                assert!(
+                    page_ocr_done.is_none(),
+                    "non-OCR fixture should not emit page.ocr_done"
+                );
+            }
+        }
     }
 
     async fn run_upload_cache_hit_regression_fixture(
         router: Router,
         state: Arc<app::AppState>,
         fixture: UploadCacheHitRegressionFixture,
-        file_name: &str,
-        content_type: &str,
-        file_bytes: Vec<u8>,
         boundary: &str,
     ) {
-        let first = run_upload_cache_hit_request(
-            router.clone(),
-            &fixture.schema,
-            file_name,
-            content_type,
-            file_bytes.clone(),
-            boundary,
-        )
-        .await;
+        let first = run_upload_cache_hit_request(router.clone(), &fixture, boundary).await;
 
         assert_eq!(first.cached, Some(false));
         assert_eq!(
@@ -2326,15 +2597,7 @@ mod tests {
             "first request should execute OCR before caching"
         );
 
-        let second = run_upload_cache_hit_request(
-            router,
-            &fixture.schema,
-            file_name,
-            content_type,
-            file_bytes,
-            boundary,
-        )
-        .await;
+        let second = run_upload_cache_hit_request(router, &fixture, boundary).await;
 
         assert_eq!(second.cached, Some(true));
         assert_eq!(
@@ -2385,19 +2648,17 @@ mod tests {
         router: Router,
         state: Arc<app::AppState>,
         fixture: UploadSyncFailureRegressionFixture,
-        file_name: &str,
-        content_type: &str,
-        file_bytes: Vec<u8>,
         boundary: &str,
     ) {
+        let asset = resolve_fixture_asset(&fixture.asset);
         let before_task_ids = state.events.task_ids().await;
         let payload = send_standard_upload_request(
             router.clone(),
             "sync",
             &fixture.schema,
-            file_name,
-            content_type,
-            file_bytes,
+            &asset.file_name,
+            &asset.content_type,
+            load_fixture_bytes(&asset.asset_path),
             boundary,
         )
         .await;
@@ -2491,19 +2752,17 @@ mod tests {
 
     async fn run_upload_cache_hit_request(
         router: Router,
-        schema: &SchemaSpec,
-        file_name: &str,
-        content_type: &str,
-        file_bytes: Vec<u8>,
+        fixture: &UploadCacheHitRegressionFixture,
         boundary: &str,
     ) -> UploadRequestOutcome {
+        let asset = resolve_fixture_asset(&fixture.asset);
         let payload = send_standard_upload_request(
             router,
             "sync",
-            schema,
-            file_name,
-            content_type,
-            file_bytes,
+            &fixture.schema,
+            &asset.file_name,
+            &asset.content_type,
+            load_fixture_bytes(&asset.asset_path),
             boundary,
         )
         .await;
@@ -2793,5 +3052,139 @@ mod tests {
         assert_eq!(second_delta.len(), 1);
         assert_eq!(second_delta[0].revision, 2);
         assert_eq!(second_delta[0].new_evidences.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn incremental_events_include_page_context_for_partial_and_block_events() {
+        let state = Arc::new(app::build_state(&test_config()));
+        let task_id = "task-incremental-page-context";
+        state.events.ensure_task(task_id).await;
+
+        let mut metadata = DocumentMetadata::default();
+        metadata
+            .extra
+            .insert("ocr_page_2_rotation_degrees".to_string(), "180".to_string());
+        let document = DocumentIr {
+            doc_id: "doc-incremental-page-context".to_string(),
+            source_type: SourceType::Pdf,
+            pages: vec![
+                PageIr {
+                    page_no: 1,
+                    width: Some(1000.0),
+                    height: Some(1400.0),
+                    blocks: vec![],
+                },
+                PageIr {
+                    page_no: 2,
+                    width: Some(1242.0),
+                    height: Some(1660.0),
+                    blocks: vec![TextBlock {
+                        block_id: "b2".to_string(),
+                        page_no: 2,
+                        text: "岗位类型：高级运营".to_string(),
+                        bbox: None,
+                        confidence: Some(0.95),
+                        source_kind: BlockSourceKind::Ocr,
+                    }],
+                },
+            ],
+            plain_text: "岗位类型：高级运营".to_string(),
+            metadata,
+        };
+        let result = ExtractionResult {
+            task_id: task_id.to_string(),
+            status: TaskStatus::Succeeded,
+            fields: vec![FieldValue {
+                key: "岗位类型".to_string(),
+                value: json!("高级运营"),
+                confidence: Some(0.95),
+                evidences: vec![Evidence {
+                    page_no: Some(2),
+                    text: "岗位类型：高级运营".to_string(),
+                    bbox: Some(BBox {
+                        x1: 10.0,
+                        y1: 20.0,
+                        x2: 120.0,
+                        y2: 48.0,
+                    }),
+                    source_block_ids: vec!["b2".to_string()],
+                }],
+            }],
+            raw_text: Some("岗位类型：高级运营".to_string()),
+            timings: crate::domain::TimingBreakdown::default(),
+        };
+
+        publish_incremental_result_events(
+            &state,
+            task_id,
+            &mut PartialResultTracker::default(),
+            &document,
+            &result,
+            &ExtractionOptions {
+                return_raw_text: true,
+                return_evidence: true,
+            },
+            2,
+            2,
+            2,
+        )
+        .await;
+
+        let subscription = state.events.subscribe(task_id).await.expect("subscription");
+        let partial = subscription
+            .history
+            .iter()
+            .find(|event| event.event_type == "result.partial")
+            .expect("result.partial event");
+        assert_eq!(partial.payload.get("page_no"), Some(&json!(2)));
+        assert_eq!(partial.payload.get("width"), Some(&json!(1242.0)));
+        assert_eq!(partial.payload.get("height"), Some(&json!(1660.0)));
+        assert_eq!(partial.payload.get("rotation_degrees"), Some(&json!(180.0)));
+        assert_eq!(
+            partial.payload.get("bbox"),
+            Some(&json!({
+                "x1": 10.0,
+                "y1": 20.0,
+                "x2": 120.0,
+                "y2": 48.0
+            }))
+        );
+        assert_eq!(
+            partial.payload.get("bboxes"),
+            Some(&json!([{
+                "x1": 10.0,
+                "y1": 20.0,
+                "x2": 120.0,
+                "y2": 48.0
+            }]))
+        );
+
+        let block = subscription
+            .history
+            .iter()
+            .find(|event| event.event_type == "block.extracted")
+            .expect("block.extracted event");
+        assert_eq!(block.payload.get("page_no"), Some(&json!(2)));
+        assert_eq!(block.payload.get("width"), Some(&json!(1242.0)));
+        assert_eq!(block.payload.get("height"), Some(&json!(1660.0)));
+        assert_eq!(block.payload.get("rotation_degrees"), Some(&json!(180.0)));
+        assert_eq!(
+            block.payload.get("bbox"),
+            Some(&json!({
+                "x1": 10.0,
+                "y1": 20.0,
+                "x2": 120.0,
+                "y2": 48.0
+            }))
+        );
+        assert_eq!(
+            block.payload.get("bboxes"),
+            Some(&json!([{
+                "x1": 10.0,
+                "y1": 20.0,
+                "x2": 120.0,
+                "y2": 48.0
+            }]))
+        );
     }
 }

@@ -1,9 +1,9 @@
 {
   "asset": {
-    "asset_id": "image_upload_green"
+    "asset_id": "profile_upload_docx"
   },
   "schema": {
-    "name": "image-cache-demo",
+    "name": "docx-demo",
     "version": "1",
     "fields": [
       {
@@ -16,10 +16,9 @@
       }
     ]
   },
-  "expected_raw_text": "岗位类型：图片运营",
+  "expected_raw_text": "岗位类型：文档运营\n人设要点：结构化表达",
   "expected_field_key": "岗位类型",
-  "expected_field_value": "图片运营",
-  "expected_cache_hit": {
-    "hit_count": 1
-  }
+  "expected_field_value": "文档运营",
+  "expected_evidence_page_nos": [1],
+  "expected_page_ocr_done": null
 }

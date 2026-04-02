@@ -1,4 +1,7 @@
 {
+  "asset": {
+    "asset_id": "scanned_upload_pdf"
+  },
   "schema": {
     "name": "pdf-raster-failure",
     "version": "1",

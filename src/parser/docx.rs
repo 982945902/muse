@@ -43,6 +43,7 @@ impl Parser for DocxParser {
                 .paragraphs
                 .iter()
                 .map(|paragraph| shared::BlockInput {
+                    block_id: None,
                     text: paragraph.clone(),
                     page_no: 1,
                     bbox: None,
