@@ -107,6 +107,7 @@ mod tests {
     struct TestOcrProvider;
     struct FixtureImageOcrProvider;
     struct RasterAwareOcrProvider;
+    struct SparseRasterAwareOcrProvider;
     struct TestPdfProvider;
     struct TestScanPdfProvider;
     struct TestRasterScanPdfProvider;
@@ -317,6 +318,56 @@ mod tests {
                 timing_ms: None,
                 warnings: vec![],
                 provider: Some("raster-aware-ocr".to_string()),
+                model: Some("png-page-model".to_string()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl OcrProvider for SparseRasterAwareOcrProvider {
+        fn name(&self) -> &'static str {
+            "sparse-raster-aware-ocr"
+        }
+
+        async fn recognize(&self, request: OcrRequest) -> anyhow::Result<OcrOutput> {
+            assert_eq!(request.mime_type.as_deref(), Some("image/png"));
+            assert!(request.bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+
+            let image = ::image::load_from_memory(&request.bytes).expect("decode png");
+            let pixel = image.get_pixel(0, 0).0;
+            let is_first_page = pixel[0] > pixel[2];
+
+            Ok(OcrOutput {
+                pages: vec![OcrPage {
+                    page_no: 1,
+                    width: Some(image.width() as f32),
+                    height: Some(image.height() as f32),
+                    rotation_degrees: None,
+                    request_id: None,
+                    timing_ms: None,
+                    warnings: vec![],
+                }],
+                blocks: vec![],
+                lines: if is_first_page {
+                    vec![OcrLine {
+                        block_id: None,
+                        text: "第一页结果".to_string(),
+                        page_no: Some(1),
+                        bbox: Some(BBox {
+                            x1: 4.0,
+                            y1: 8.0,
+                            x2: 64.0,
+                            y2: 28.0,
+                        }),
+                        confidence: Some(0.93),
+                    }]
+                } else {
+                    vec![]
+                },
+                request_id: None,
+                timing_ms: None,
+                warnings: vec![],
+                provider: Some("sparse-raster-aware-ocr".to_string()),
                 model: Some("png-page-model".to_string()),
             })
         }
@@ -876,8 +927,10 @@ mod tests {
                 .map(String::as_str),
             Some("test-inline-rasterizer")
         );
-        assert_eq!(document.pages.len(), 1);
+        assert_eq!(document.pages.len(), 3);
         assert_eq!(document.pages[0].blocks.len(), 2);
+        assert!(document.pages[1].blocks.is_empty());
+        assert!(document.pages[2].blocks.is_empty());
         assert_eq!(
             document
                 .metadata
@@ -956,6 +1009,49 @@ mod tests {
         );
         assert!(document.plain_text.contains("第一页结果"));
         assert!(document.plain_text.contains("第二页结果"));
+    }
+
+    #[tokio::test]
+    async fn preserves_empty_pdf_pages_when_some_raster_ocr_pages_have_no_blocks() {
+        let parser = DefaultParser::new(
+            Arc::new(SparseRasterAwareOcrProvider),
+            Arc::new(TestRasterScanPdfProvider),
+            Arc::new(TestDocxProvider),
+        );
+        let input = ParseInput::from_upload(
+            "scan-pages-sparse.pdf".to_string(),
+            Some("application/pdf".to_string()),
+            load_asset_bytes("scanned_upload_pdf"),
+        );
+
+        let document = parser.parse(input).await.expect("parse should succeed");
+
+        assert!(matches!(document.source_type, SourceType::Pdf));
+        assert_eq!(document.pages.len(), 2);
+        assert_eq!(document.pages[0].page_no, 1);
+        assert_eq!(document.pages[1].page_no, 2);
+        assert_eq!(document.pages[0].blocks.len(), 1);
+        assert!(document.pages[1].blocks.is_empty());
+        assert_eq!(document.pages[1].width, Some(1242.0));
+        assert_eq!(document.pages[1].height, Some(1660.0));
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_page_2_line_count")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            document
+                .metadata
+                .extra
+                .get("ocr_page_2_block_count")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert!(document.plain_text.contains("第一页结果"));
+        assert!(!document.plain_text.contains("第二页结果"));
     }
 
     #[tokio::test]

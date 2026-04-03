@@ -1191,7 +1191,7 @@ data: {"sequence":6,"event_type":"completed","task_id":"task_123","created_at_ms
 - 已接入 `task.accepted / stage.changed / document.ready / page.parsed / page.ocr_done / block.extracted / result.partial / result.snapshot / cache.hit / completed / failed`。
 - `result.partial` 已支持按页面前缀逐步修订，同一字段可随着后续页面继续更新。
 - `page.parsed` 已可携带页级 `width / height`，便于前端先建立页面坐标系。
-- `page.ocr_done` 已可携带 `width / height / rotation_degrees / ocr_block_count / ocr_line_count` 与 OCR provider 元信息，并附带 `ocr_request_id / ocr_timing_ms / ocr_warnings[] / ocr_blocks_preview[]`，便于前端直接做 bbox 叠加、排障和 OCR 调试展示；当存在页级 OCR 可观测字段时，事件优先使用 `ocr_page_{n}_*`，否则回退到全局 `ocr_*`。
+- `page.ocr_done` 已可携带 `width / height / rotation_degrees / ocr_block_count / ocr_line_count` 与 OCR provider 元信息，并附带 `ocr_request_id / ocr_timing_ms / ocr_warnings[] / ocr_blocks_preview[]`，便于前端直接做 bbox 叠加、排障和 OCR 调试展示；当存在页级 OCR 可观测字段时，事件优先使用 `ocr_page_{n}_*`，否则回退到全局 `ocr_*`；即使某页 OCR 已执行但结果为空，也会继续发出 `page.ocr_done`，只是 `ocr_block_count / ocr_line_count = 0`。
 - 当前实现里，增量型 `result.partial` 与 `block.extracted` 事件也已可携带页级 `width / height / rotation_degrees`，便于字段高亮直接挂回当前页面。
 - `result.partial` 与 `block.extracted` 当前都可额外携带聚合后的 `bbox` 与去重后的 `bboxes[]`，便于前端直接绘制字段高亮框，而不必自己再做 evidence 框合并。
 
@@ -1213,8 +1213,11 @@ data: {"sequence":6,"event_type":"completed","task_id":"task_123","created_at_ms
 - normalized 协议版本。
 - 是否兼容仅携带 `sdk_version` 的旧 SDK。
 - parser 版本。
-- OCR provider 版本。
+- OCR provider 与 transport。
 - extractor 版本。
+- PDF raster provider。
+- queue provider。
+- storage provider。
 
 
 ## 13. 同步与异步策略
@@ -1662,7 +1665,11 @@ ONNX sidecar 约定：
 
 - 若 `model.onnx` 同目录下存在 `model.json`，服务会自动加载。
 - 也可以通过 `MUSE_ONNX_MODEL_SPEC_PATH` 显式指定 sidecar。
-- 当前 sidecar 主要用于声明字符串输入输出名称和解码策略，避免将模型契约散落在环境变量中。
+- 当前支持两级契约来源：
+  - `ONNX metadata` 中的自定义 key `muse.contract_json` 或 `muse_contract_json`
+  - sidecar `model.json`
+- 当前解析策略为：优先读取 ONNX embedded metadata；若 embedded 只声明了部分字段，则缺失字段继续回退到 sidecar；若两者都缺失，再回退到环境变量默认值。
+- 当前 sidecar/embedded contract 主要用于声明字符串输入输出名称、tokenized 输入输出名和解码策略，避免将模型契约散落在环境变量中。
 - 当前已能执行 `text/schema/json_output` 这一类字符串 I/O 真推理，并将结果解码回统一字段输出。
 
 最终目标不是构建一个“模型演示程序”，而是构建一个“低成本、可扩展、可审计”的统一提取平台。
@@ -1733,7 +1740,7 @@ ONNX sidecar 约定：
   - 但 tokenized/UIE 仍缺真实模型集成验证，离生产完成态还有距离
 - 异步任务能力目前是“接口可用，但底层还是进程内实现”。
   - queue 是 in-memory
-  - storage 是 in-memory
+  - storage 已支持 `memory / sqlite` 双实现，但事件历史和租约语义仍未持久化
   - 更偏 MVP，不是生产级任务系统
 - 缓存能力目前是“命中和元数据已完成，但治理未完成”。
   - 已有 `hit_count / created_at_ms / last_accessed_at_ms`
@@ -1746,8 +1753,9 @@ ONNX sidecar 约定：
   - 或本地 C++/Rust OCR runtime
 - `local-onnx` 的真实 OCR inference 与 bbox/line 结果解码。
 - 持久化 storage：
-  - Postgres / SQLite
-  - 结果表、任务表、缓存索引
+  - Postgres
+  - SQLite 事件表 / 历史回放
+  - TTL 清理、租户隔离、缓存索引
 - 生产级 queue：
   - Redis / NATS / RabbitMQ
 - 页级 OCR 缓存与更细粒度成本路由。
@@ -1808,7 +1816,7 @@ ONNX sidecar 约定：
   说明：代码路径已实现，但真实模型集成验证和回归基线还未补齐。
 - `Storage / Queue / Cache`
   状态：半完成
-  说明：MVP 能跑，但目前仍是 in-memory，缺持久化与治理能力。
+  说明：`ExtractionStore` 已支持 `memory / sqlite`，任务结果与缓存元数据可落盘；但事件历史、TTL 清理和生产级 queue 仍未完成。
 - `可观测性 / 生产治理`
   状态：未完成
   说明：日志已具备基础信息，但 metrics、tracing、配额、租户治理还未完成。
@@ -1825,6 +1833,7 @@ ONNX sidecar 约定：
 - 扫描 PDF 已新增 `raster_pages` 契约，parser 会优先对页图逐页 OCR，并在 metadata 中记录 `pdf_ocr_input=page_rasters|original_pdf_bytes`。
 - `/version` 已暴露 `pdf_raster_provider`，扫描 PDF metadata 也可记录 `pdf_raster_provider` 便于排障。
 - `DocumentIR` 页/块颗粒度增强：图片按 OCR 行、PDF 按页、docx 按段落保留结构。
+- PDF parser 现在会尽量保留页结构：即便某些扫描页 OCR 没有产出 block，`DocumentIR.pages[]` 仍会按 `page_count` 保留空页壳，避免页数与原始 PDF 脱节。
 - OCR 页级元信息已可透传到 `DocumentIR.pages[]` 的 `width/height`，并通过 metadata 与 SSE 事件进一步透传 `rotation_degrees`，可直接用于前端 bbox 叠加与扫描页方向展示。
 - heuristic extractor、基础类型转换、object/array 子字段聚合。
 - ONNX Runtime CPU provider 配置入口、sidecar 约定、字符串 I/O 真推理与 JSON 输出解码。
@@ -1916,6 +1925,8 @@ pub struct LocalOnnxOcrProvider {
 - 已完成 `ocr_provider / ocr_transport` 元信息分离，并在 `/version` 与 `DocumentIR.metadata.extra` 中统一暴露。
 - 已支持按配置在主 OCR provider 失败时自动回退到备用 provider。
 - 已为扫描 PDF 补充 `raster_pages` 输入契约与逐页 OCR 聚合逻辑，并有集成测试覆盖多页页号回填。
+- 已补充扫描 PDF 空页保留逻辑：即使某页 OCR 结果为空，`DocumentIR.pages[]` 仍按 `page_count` 保留对应页，并写出该页的 `ocr_page_{n}_line_count/block_count=0`。
+- 已补充上传接口级事件语义：即使扫描 PDF 某页 OCR 结果为空，只要该页实际执行过 OCR，仍会发出 `page.ocr_done`，并携带该页 `ocr_block_count / ocr_line_count = 0` 与 PDF raster 元信息。
 - 已补充上传接口级扫描 PDF 集成测试，覆盖 `multipart upload -> parser -> OCR -> extractor -> response` 主链路。
 - 已补充 `CompositePdfProvider` 单测，覆盖“有文本层不栅格化 / 无文本层走 rasterizer”两条路径。
 - 已新增 fixture 驱动的扫描 PDF、文本层 PDF、图片、docx 上传成功回归、图片上传缓存命中回归、同步 OCR 失败回归，以及异步 OCR 失败、异步 PDF raster 失败回归样例，开始建立可扩展的 golden regression 基线。
@@ -2083,6 +2094,7 @@ sidecar 建议继续保留以下最小字段：
 
 - tokenizer 文件与模型文件一起版本化。
 - sidecar 已支持声明 `runtime_contract=tokenized`、tokenizer 路径和张量输入输出名。
+- 同样的 contract JSON 现在也可嵌入到 ONNX metadata 的 `muse.contract_json` 中；运行时会优先读取 embedded contract，并对缺失字段回退 sidecar。
 - 当前代码已经具备 tokenized 路线的基础能力：
   - tokenizer 加载与 padding/truncation 配置
   - prompt 线性化
@@ -2204,6 +2216,25 @@ cache_entries:
 - `ExtractionStore` 继续保留 `upsert / get / get_cached / put_cached`。
 - 补充 `append_event / list_events / delete_expired_cache`。
 - 后续如果引入 worker 抢占，再补 `lease_task / renew_lease / fail_task`。
+
+当前已完成：
+
+- 已新增 `SqliteStorage`，并继续保留 `InMemoryStorage`。
+- 当前 `Config` 已支持：
+  - `MUSE_STORAGE_PROVIDER=memory|sqlite`
+  - `MUSE_STORAGE_SQLITE_PATH=/path/to/muse.sqlite3`
+- `tasks` 与 `cache` 两张表的最小落盘已经接通，覆盖：
+  - `TaskRecord` upsert/get
+  - `CachedExtraction` put/get
+  - `hit_count / created_at_ms / last_accessed_at_ms`
+- `/version` 已暴露 `storage_provider`，便于确认当前部署到底跑的是内存还是 SQLite。
+- 已补充 SQLite 存储单测，覆盖任务持久化与缓存命中计数递增。
+
+当前未完成：
+
+- `task_events` 持久化与 SSE 历史回放。
+- `delete_expired_cache` 与 TTL/清理策略。
+- 多实例共享下的租约、抢占与并发写入治理。
 
 #### 25.3.2 生产版：Postgres
 

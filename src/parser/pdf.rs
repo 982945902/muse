@@ -1,6 +1,6 @@
 use super::{Parser, shared};
 use crate::{
-    domain::{BlockSourceKind, PageIr},
+    domain::{BlockSourceKind, DocumentIr, PageIr},
     ingestion::ParseInput,
     ocr::{OcrLine, OcrOutput, OcrPage, OcrProvider, OcrRequest},
     pdf::{PdfOcrPage, PdfProvider, PdfRequest},
@@ -101,6 +101,7 @@ impl Parser for PdfParser {
                 BlockSourceKind::Ocr,
                 self.name(),
             );
+            ensure_document_page_slots(&mut document, pdf_output.page_count);
             apply_ocr_page_metadata(
                 &mut document.pages,
                 &ocr_output,
@@ -136,12 +137,16 @@ impl Parser for PdfParser {
                 })
                 .collect::<Vec<_>>();
             (
-                shared::build_document_from_page_blocks(
-                    input,
-                    page_blocks,
-                    BlockSourceKind::Synthetic,
-                    self.name(),
-                ),
+                {
+                    let mut document = shared::build_document_from_page_blocks(
+                        input,
+                        page_blocks,
+                        BlockSourceKind::Synthetic,
+                        self.name(),
+                    );
+                    ensure_document_page_slots(&mut document, pdf_output.page_count);
+                    document
+                },
                 None,
                 None,
             )
@@ -224,6 +229,28 @@ impl Parser for PdfParser {
         }
         Ok(document)
     }
+}
+
+fn ensure_document_page_slots(document: &mut DocumentIr, expected_page_count: Option<u32>) {
+    let existing_max_page_no = document.pages.iter().map(|page| page.page_no).max().unwrap_or(0);
+    let target_page_count = expected_page_count.unwrap_or(0).max(existing_max_page_no).max(1);
+
+    let mut existing_pages = document
+        .pages
+        .drain(..)
+        .map(|page| (page.page_no, page))
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    document.pages = (1..=target_page_count)
+        .map(|page_no| {
+            existing_pages.remove(&page_no).unwrap_or(PageIr {
+                page_no,
+                width: None,
+                height: None,
+                blocks: vec![],
+            })
+        })
+        .collect();
 }
 
 fn validate_raster_pages(raster_pages: &[PdfOcrPage]) -> anyhow::Result<()> {

@@ -5,6 +5,8 @@ pub struct Config {
     pub listen_addr: SocketAddr,
     pub service_name: String,
     pub log_filter: String,
+    pub storage_provider: String,
+    pub storage_sqlite_path: Option<String>,
     pub extractor_provider: String,
     pub onnx_model_path: Option<String>,
     pub onnx_model_spec_path: Option<String>,
@@ -35,6 +37,9 @@ impl Config {
         let service_name =
             env::var("MUSE_SERVICE_NAME").unwrap_or_else(|_| "muse-extraction-service".to_string());
         let log_filter = env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string());
+        let storage_provider =
+            env::var("MUSE_STORAGE_PROVIDER").unwrap_or_else(|_| "memory".to_string());
+        let storage_sqlite_path = env::var("MUSE_STORAGE_SQLITE_PATH").ok();
         let extractor_provider =
             env::var("MUSE_EXTRACTOR_PROVIDER").unwrap_or_else(|_| "heuristic".to_string());
         let onnx_model_path = env::var("MUSE_ONNX_MODEL_PATH").ok();
@@ -96,6 +101,8 @@ impl Config {
             listen_addr,
             service_name,
             log_filter,
+            storage_provider,
+            storage_sqlite_path,
             extractor_provider,
             onnx_model_path,
             onnx_model_spec_path,

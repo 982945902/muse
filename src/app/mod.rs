@@ -12,7 +12,7 @@ use crate::{
     pdf::{CompositePdfProvider, PdfProvider},
     postprocess::{DefaultPostprocessor, Postprocessor},
     queue::{InMemoryQueue, TaskQueue},
-    storage::{ExtractionStore, InMemoryStorage},
+    storage::{ExtractionStore, InMemoryStorage, SqliteStorage},
 };
 use std::sync::Arc;
 
@@ -48,6 +48,22 @@ fn build_ocr_provider_by_name(config: &Config, provider_name: &str) -> Arc<dyn O
     }
 }
 
+fn build_storage(config: &Config) -> Arc<dyn ExtractionStore> {
+    match config.storage_provider.as_str() {
+        "memory" => Arc::new(InMemoryStorage::default()),
+        "sqlite" => {
+            let path = config.storage_sqlite_path.as_deref().unwrap_or_else(|| {
+                panic!("`MUSE_STORAGE_SQLITE_PATH` is required when storage provider is `sqlite`")
+            });
+            Arc::new(
+                SqliteStorage::new(path)
+                    .unwrap_or_else(|error| panic!("failed to configure sqlite storage: {error}")),
+            )
+        }
+        other => panic!("unsupported storage provider `{other}`"),
+    }
+}
+
 pub fn build_state_with_providers(
     config: &Config,
     ocr: Arc<dyn OcrProvider>,
@@ -66,7 +82,7 @@ pub fn build_state_with_providers(
         pdf,
         docx,
         queue: Arc::new(InMemoryQueue),
-        storage: Arc::new(InMemoryStorage::default()),
+        storage: build_storage(config),
         events: Arc::new(EventHub::default()),
     }
 }

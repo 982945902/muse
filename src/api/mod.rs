@@ -94,6 +94,7 @@ pub struct VersionResponse {
     pub pdf_raster_provider: String,
     pub docx_provider: &'static str,
     pub queue_provider: &'static str,
+    pub storage_provider: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,6 +133,7 @@ async fn version(State(state): State<Arc<AppState>>) -> Json<VersionResponse> {
         pdf_raster_provider: state.config.pdf_raster_provider.clone(),
         docx_provider: state.docx.name(),
         queue_provider: state.queue.name(),
+        storage_provider: state.storage.name(),
     })
 }
 
@@ -736,7 +738,14 @@ async fn publish_document_events(state: &Arc<AppState>, task_id: &str, document:
             .iter()
             .filter(|block| matches!(block.source_kind, crate::domain::BlockSourceKind::Ocr))
             .count();
-        if ocr_block_count > 0 {
+        let metadata_ocr_block_count =
+            lookup_ocr_page_usize_metric(&document.metadata, page.page_no, "block_count");
+        let metadata_ocr_line_count =
+            lookup_ocr_page_usize_metric(&document.metadata, page.page_no, "line_count");
+        if ocr_block_count > 0
+            || metadata_ocr_block_count.is_some()
+            || metadata_ocr_line_count.is_some()
+        {
             publish_event(
                 state,
                 task_id,
@@ -746,17 +755,8 @@ async fn publish_document_events(state: &Arc<AppState>, task_id: &str, document:
                     "width": page.width,
                     "height": page.height,
                     "rotation_degrees": lookup_ocr_page_rotation_degrees(&document.metadata, page.page_no),
-                    "ocr_block_count": lookup_ocr_page_usize_metric(
-                        &document.metadata,
-                        page.page_no,
-                        "block_count",
-                    )
-                    .unwrap_or(ocr_block_count),
-                    "ocr_line_count": lookup_ocr_page_usize_metric(
-                        &document.metadata,
-                        page.page_no,
-                        "line_count",
-                    ),
+                    "ocr_block_count": metadata_ocr_block_count.unwrap_or(ocr_block_count),
+                    "ocr_line_count": metadata_ocr_line_count,
                     "ocr_provider": document.metadata.extra.get("ocr_provider"),
                     "ocr_model": document.metadata.extra.get("ocr_model"),
                     "ocr_transport": document.metadata.extra.get("ocr_transport"),
@@ -1578,6 +1578,7 @@ mod tests {
     use tower::util::ServiceExt;
 
     struct RasterAwareOcrProvider;
+    struct SparseRasterAwareOcrProvider;
     struct RotatingImageOcrProvider;
     struct RasterScanPdfProvider;
     struct FailingOcrProvider;
@@ -1699,6 +1700,60 @@ mod tests {
                 timing_ms: None,
                 warnings: vec![],
                 provider: Some("raster-aware-ocr".to_string()),
+                model: Some("png-page-model".to_string()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl OcrProvider for SparseRasterAwareOcrProvider {
+        fn name(&self) -> &'static str {
+            "sparse-raster-aware-ocr"
+        }
+
+        fn transport_name(&self) -> &'static str {
+            "inproc"
+        }
+
+        async fn recognize(&self, request: OcrRequest) -> anyhow::Result<OcrOutput> {
+            assert_eq!(request.mime_type.as_deref(), Some("image/png"));
+            assert!(request.bytes.starts_with(&[0x89, b'P', b'N', b'G']));
+
+            let image = ::image::load_from_memory(&request.bytes).expect("decode png");
+            let pixel = image.get_pixel(0, 0).0;
+            let is_first_page = pixel[0] > pixel[2];
+
+            Ok(OcrOutput {
+                pages: vec![OcrPage {
+                    page_no: 1,
+                    width: Some(image.width() as f32),
+                    height: Some(image.height() as f32),
+                    rotation_degrees: None,
+                    request_id: None,
+                    timing_ms: None,
+                    warnings: vec![],
+                }],
+                blocks: vec![],
+                lines: if is_first_page {
+                    vec![OcrLine {
+                        block_id: None,
+                        text: "岗位类型：第一页结果".to_string(),
+                        page_no: Some(1),
+                        bbox: Some(BBox {
+                            x1: 4.0,
+                            y1: 8.0,
+                            x2: 80.0,
+                            y2: 28.0,
+                        }),
+                        confidence: Some(0.95),
+                    }]
+                } else {
+                    vec![]
+                },
+                request_id: None,
+                timing_ms: None,
+                warnings: vec![],
+                provider: Some("sparse-raster-aware-ocr".to_string()),
                 model: Some("png-page-model".to_string()),
             })
         }
@@ -1912,6 +1967,10 @@ mod tests {
             payload.get("pdf_raster_provider"),
             Some(&serde_json::Value::String("none".to_string()))
         );
+        assert_eq!(
+            payload.get("storage_provider"),
+            Some(&serde_json::Value::String("memory".to_string()))
+        );
     }
 
     #[tokio::test]
@@ -1976,6 +2035,76 @@ mod tests {
         ));
         let router = app::build_router((*state).clone());
         run_upload_regression_fixture(router, state, fixture, "muse-boundary").await;
+    }
+
+    #[tokio::test]
+    async fn upload_endpoint_emits_page_ocr_done_for_empty_scanned_pdf_pages() {
+        let state = Arc::new(test_state_with_providers(
+            Arc::new(SparseRasterAwareOcrProvider),
+            Arc::new(RasterScanPdfProvider),
+            Arc::new(ZipDocxProvider),
+        ));
+        let router = app::build_router((*state).clone());
+        let fixture =
+            load_upload_regression_fixture("fixtures/extraction/scanned_pdf_upload_fixture.json");
+        let asset = resolve_fixture_asset(&fixture.asset);
+        let payload = send_standard_upload_request(
+            router,
+            "sync",
+            &fixture.schema,
+            &asset.file_name,
+            &asset.content_type,
+            load_fixture_bytes(&asset.asset_path),
+            "muse-sparse-pdf-boundary",
+        )
+        .await;
+
+        assert_eq!(payload.status, StatusCode::OK);
+        let task_id = payload
+            .payload
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("task id");
+
+        let subscription = state.events.subscribe(task_id).await.expect("subscription");
+        let page_ocr_done_events = subscription
+            .history
+            .iter()
+            .filter(|event| event.event_type == "page.ocr_done")
+            .collect::<Vec<_>>();
+
+        assert_eq!(page_ocr_done_events.len(), 2);
+        assert_eq!(page_ocr_done_events[0].payload.get("page_no"), Some(&json!(1)));
+        assert_eq!(
+            page_ocr_done_events[0].payload.get("ocr_block_count"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            page_ocr_done_events[0].payload.get("ocr_line_count"),
+            Some(&json!(1))
+        );
+
+        assert_eq!(page_ocr_done_events[1].payload.get("page_no"), Some(&json!(2)));
+        assert_eq!(
+            page_ocr_done_events[1].payload.get("ocr_block_count"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            page_ocr_done_events[1].payload.get("ocr_line_count"),
+            Some(&json!(0))
+        );
+        assert_eq!(
+            page_ocr_done_events[1].payload.get("ocr_blocks_preview"),
+            Some(&json!([]))
+        );
+        assert_eq!(
+            page_ocr_done_events[1].payload.get("pdf_ocr_input"),
+            Some(&json!("page_rasters"))
+        );
+        assert_eq!(
+            page_ocr_done_events[1].payload.get("pdf_raster_provider"),
+            Some(&json!("test-inline-rasterizer"))
+        );
     }
 
     #[tokio::test]
@@ -2496,6 +2625,8 @@ mod tests {
             listen_addr: "127.0.0.1:0".parse().expect("socket addr"),
             service_name: "test-service".to_string(),
             log_filter: "info".to_string(),
+            storage_provider: "memory".to_string(),
+            storage_sqlite_path: None,
             extractor_provider: "heuristic".to_string(),
             onnx_model_path: None,
             onnx_model_spec_path: None,

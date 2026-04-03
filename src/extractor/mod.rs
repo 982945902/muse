@@ -66,6 +66,7 @@ enum OnnxRuntimeContractKind {
     Tokenized,
 }
 
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct OnnxTokenizedInputNames {
     input_ids: String,
@@ -73,12 +74,14 @@ struct OnnxTokenizedInputNames {
     token_type_ids: Option<String>,
 }
 
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct OnnxTokenizedOutputNames {
     start_probs: String,
     end_probs: String,
 }
 
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct OnnxModelSpec {
     #[serde(default = "default_onnx_spec_protocol_version")]
@@ -94,6 +97,23 @@ struct OnnxModelSpec {
     outputs: Option<OnnxTokenizedOutputNames>,
     #[serde(default)]
     decode_strategy: OnnxDecodeStrategy,
+}
+
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct LoadedOnnxModelSpec {
+    raw: Value,
+    tokenizer_base_path: PathBuf,
+    spec_path: Option<PathBuf>,
+}
+
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
+#[derive(Clone, Debug)]
+struct OnnxContractResolutionConfig {
+    explicit_spec_path: Option<String>,
+    input_text_name: String,
+    input_schema_name: String,
+    output_json_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,31 +149,34 @@ struct ResolvedOnnxModelContract {
     _spec_path: Option<PathBuf>,
 }
 
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
 fn default_onnx_spec_protocol_version() -> u32 {
     1
 }
 
-fn resolve_sidecar_relative_path(spec_path: &Path, raw_path: &str) -> PathBuf {
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
+fn resolve_relative_resource_path(base_path: &Path, raw_path: &str) -> PathBuf {
     let candidate = PathBuf::from(raw_path);
     if candidate.is_absolute() {
         return candidate;
     }
 
-    spec_path
+    base_path
         .parent()
         .map(|parent| parent.join(candidate.clone()))
         .unwrap_or(candidate)
 }
 
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
 fn resolve_tokenized_contract(
     spec: &OnnxModelSpec,
-    spec_path: &Path,
+    base_path: &Path,
 ) -> anyhow::Result<ResolvedOnnxTokenizedContract> {
     let tokenizer_path = spec
         .tokenizer_path
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("tokenized ONNX model spec requires `tokenizer_path`"))?;
-    let tokenizer_path = resolve_sidecar_relative_path(spec_path, tokenizer_path);
+    let tokenizer_path = resolve_relative_resource_path(base_path, tokenizer_path);
     if !tokenizer_path.is_file() {
         anyhow::bail!(
             "ONNX tokenizer file was not found: {}",
@@ -189,10 +212,67 @@ fn resolve_tokenized_contract(
     })
 }
 
-fn maybe_load_onnx_model_spec(
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
+fn parse_onnx_model_spec(raw: Value, source_label: &str) -> anyhow::Result<OnnxModelSpec> {
+    let spec = serde_json::from_value::<OnnxModelSpec>(raw).map_err(|error| {
+        anyhow::anyhow!("failed to parse ONNX model spec from {source_label}: {error}")
+    })?;
+    if spec.protocol_version != default_onnx_spec_protocol_version() {
+        anyhow::bail!(
+            "unsupported ONNX model spec protocol_version `{}`, expected `{}`",
+            spec.protocol_version,
+            default_onnx_spec_protocol_version()
+        );
+    }
+    Ok(spec)
+}
+
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
+fn parse_onnx_model_spec_json_value(raw: &str, source_label: &str) -> anyhow::Result<Value> {
+    let value = serde_json::from_str::<Value>(raw).map_err(|error| {
+        anyhow::anyhow!("failed to parse ONNX model spec JSON from {source_label}: {error}")
+    })?;
+    if !value.is_object() {
+        anyhow::bail!("ONNX model spec from {source_label} must decode to a JSON object");
+    }
+    Ok(value)
+}
+
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
+fn merge_onnx_model_spec_values(base: Option<Value>, overlay: Option<Value>) -> Option<Value> {
+    match (base, overlay) {
+        (None, None) => None,
+        (Some(base), None) => Some(base),
+        (None, Some(overlay)) => Some(overlay),
+        (Some(mut base), Some(overlay)) => {
+            merge_json_value(&mut base, overlay);
+            Some(base)
+        }
+    }
+}
+
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
+fn merge_json_value(target: &mut Value, overlay: Value) {
+    match (target, overlay) {
+        (Value::Object(target_object), Value::Object(overlay_object)) => {
+            for (key, overlay_value) in overlay_object {
+                match target_object.get_mut(&key) {
+                    Some(target_value) => merge_json_value(target_value, overlay_value),
+                    None => {
+                        target_object.insert(key, overlay_value);
+                    }
+                }
+            }
+        }
+        (target, overlay) => *target = overlay,
+    }
+}
+
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
+fn maybe_load_sidecar_onnx_model_spec(
     model_path: &Path,
     explicit_spec_path: Option<&str>,
-) -> anyhow::Result<Option<(OnnxModelSpec, PathBuf)>> {
+) -> anyhow::Result<Option<LoadedOnnxModelSpec>> {
     let implicit_path = model_path.with_extension("json");
     let spec_path = explicit_spec_path
         .map(PathBuf::from)
@@ -210,18 +290,14 @@ fn maybe_load_onnx_model_spec(
     }
 
     let raw = fs::read_to_string(&spec_path)?;
-    let spec = serde_json::from_str::<OnnxModelSpec>(&raw)?;
-    if spec.protocol_version != default_onnx_spec_protocol_version() {
-        anyhow::bail!(
-            "unsupported ONNX model spec protocol_version `{}`, expected `{}`",
-            spec.protocol_version,
-            default_onnx_spec_protocol_version()
-        );
-    }
-
-    Ok(Some((spec, spec_path)))
+    Ok(Some(LoadedOnnxModelSpec {
+        raw: parse_onnx_model_spec_json_value(&raw, &format!("sidecar `{}`", spec_path.display()))?,
+        tokenizer_base_path: spec_path.clone(),
+        spec_path: Some(spec_path),
+    }))
 }
 
+#[allow(dead_code)]
 fn resolve_onnx_model_contract(
     model_path: &Path,
     explicit_spec_path: Option<&str>,
@@ -229,15 +305,73 @@ fn resolve_onnx_model_contract(
     input_schema_name: &str,
     output_json_name: &str,
 ) -> anyhow::Result<ResolvedOnnxModelContract> {
-    let spec = maybe_load_onnx_model_spec(model_path, explicit_spec_path)?;
+    resolve_onnx_model_contract_from_sources(
+        model_path,
+        explicit_spec_path,
+        input_text_name,
+        input_schema_name,
+        output_json_name,
+        None,
+    )
+}
 
-    Ok(match spec {
-        Some((spec, spec_path)) => {
+#[cfg_attr(not(feature = "onnx-runtime"), allow(dead_code))]
+fn resolve_onnx_model_contract_from_sources(
+    model_path: &Path,
+    explicit_spec_path: Option<&str>,
+    input_text_name: &str,
+    input_schema_name: &str,
+    output_json_name: &str,
+    embedded_spec_json: Option<&str>,
+) -> anyhow::Result<ResolvedOnnxModelContract> {
+    let embedded_spec = if let Some(raw) = embedded_spec_json {
+        Some(LoadedOnnxModelSpec {
+            raw: parse_onnx_model_spec_json_value(
+                raw,
+                &format!("embedded ONNX metadata in `{}`", model_path.display()),
+            )?,
+            tokenizer_base_path: model_path.to_path_buf(),
+            spec_path: None,
+        })
+    } else {
+        None
+    };
+    let sidecar_spec = maybe_load_sidecar_onnx_model_spec(model_path, explicit_spec_path)?;
+    let tokenizer_base_path = if embedded_spec
+        .as_ref()
+        .and_then(|spec| spec.raw.as_object())
+        .is_some_and(|object| object.contains_key("tokenizer_path"))
+    {
+        model_path.to_path_buf()
+    } else {
+        sidecar_spec
+            .as_ref()
+            .map(|spec| spec.tokenizer_base_path.clone())
+            .unwrap_or_else(|| model_path.to_path_buf())
+    };
+    let merged_spec = merge_onnx_model_spec_values(
+        sidecar_spec.as_ref().map(|spec| spec.raw.clone()),
+        embedded_spec.as_ref().map(|spec| spec.raw.clone()),
+    );
+
+    Ok(match merged_spec {
+        Some(raw_spec) => {
+            let source_label = if embedded_spec.is_some() {
+                format!(
+                    "merged ONNX spec (embedded metadata + sidecar/defaults) for `{}`",
+                    model_path.display()
+                )
+            } else if sidecar_spec.is_some() {
+                format!("sidecar ONNX spec for `{}`", model_path.display())
+            } else {
+                format!("ONNX spec for `{}`", model_path.display())
+            };
+            let spec = parse_onnx_model_spec(raw_spec, &source_label)?;
             let runtime_contract = spec.runtime_contract.clone();
             let tokenized = match runtime_contract {
                 OnnxRuntimeContractKind::StringIo => None,
                 OnnxRuntimeContractKind::Tokenized => {
-                    Some(resolve_tokenized_contract(&spec, &spec_path)?)
+                    Some(resolve_tokenized_contract(&spec, &tokenizer_base_path)?)
                 }
             };
 
@@ -257,7 +391,7 @@ fn resolve_onnx_model_contract(
                     .unwrap_or_else(|| output_json_name.to_string()),
                 tokenized,
                 _decode_strategy: spec.decode_strategy,
-                _spec_path: Some(spec_path),
+                _spec_path: sidecar_spec.and_then(|spec| spec.spec_path),
             }
         }
         None => ResolvedOnnxModelContract {
@@ -1595,16 +1729,15 @@ impl OnnxRuntimeExtractor {
             anyhow::anyhow!("`MUSE_ONNX_MODEL_PATH` is required when MUSE_EXTRACTOR_PROVIDER=onnx")
         })?;
         let model_path = PathBuf::from(model_path);
-        let contract = resolve_onnx_model_contract(
-            &model_path,
-            config.onnx_model_spec_path.as_deref(),
-            &config.onnx_input_text_name,
-            &config.onnx_input_schema_name,
-            &config.onnx_output_json_name,
-        )?;
+        let resolution = OnnxContractResolutionConfig {
+            explicit_spec_path: config.onnx_model_spec_path.clone(),
+            input_text_name: config.onnx_input_text_name.clone(),
+            input_schema_name: config.onnx_input_schema_name.clone(),
+            output_json_name: config.onnx_output_json_name.clone(),
+        };
 
         Ok(Self {
-            inner: OnnxRuntimeBackend::new(model_path, config.onnx_threads, contract)?,
+            inner: OnnxRuntimeBackend::new(model_path, config.onnx_threads, resolution)?,
         })
     }
 }
@@ -1660,6 +1793,31 @@ impl OrtValueGuard {
 
     fn as_const_ptr(&self) -> *const ort_sys::OrtValue {
         self.ptr as *const ort_sys::OrtValue
+    }
+}
+
+#[cfg(feature = "onnx-runtime")]
+#[derive(Debug)]
+struct OrtModelMetadataGuard {
+    ptr: *mut ort_sys::OrtModelMetadata,
+}
+
+#[cfg(feature = "onnx-runtime")]
+impl OrtModelMetadataGuard {
+    fn new(ptr: *mut ort_sys::OrtModelMetadata) -> Self {
+        Self { ptr }
+    }
+}
+
+#[cfg(feature = "onnx-runtime")]
+impl Drop for OrtModelMetadataGuard {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                ort_api().ReleaseModelMetadata.unwrap()(self.ptr);
+            }
+            self.ptr = ptr::null_mut();
+        }
     }
 }
 
@@ -2475,6 +2633,52 @@ impl OnnxSession {
         &self.outputs
     }
 
+    fn read_embedded_contract_json(&self) -> anyhow::Result<Option<String>> {
+        for key in ["muse.contract_json", "muse_contract_json"] {
+            if let Some(value) = self.lookup_custom_metadata(key)? {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    fn lookup_custom_metadata(&self, key: &str) -> anyhow::Result<Option<String>> {
+        let mut metadata_ptr = ptr::null_mut();
+        ort_status_to_result(
+            unsafe {
+                ort_api().SessionGetModelMetadata.unwrap()(self.session_ptr, &mut metadata_ptr)
+            },
+            "failed to read ONNX model metadata",
+        )?;
+        let metadata = OrtModelMetadataGuard::new(metadata_ptr);
+        if metadata.ptr.is_null() {
+            return Ok(None);
+        }
+
+        let key = CString::new(key)?;
+        let mut value_ptr = ptr::null_mut();
+        ort_status_to_result(
+            unsafe {
+                ort_api().ModelMetadataLookupCustomMetadataMap.unwrap()(
+                    metadata.ptr,
+                    self.allocator_ptr,
+                    key.as_ptr(),
+                    &mut value_ptr,
+                )
+            },
+            "failed to lookup ONNX custom metadata",
+        )?;
+
+        if value_ptr.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(extract_allocated_string(
+                self.allocator_ptr,
+                value_ptr,
+            )?))
+        }
+    }
+
     async fn run(
         &self,
         inputs: &OnnxInputs,
@@ -2585,9 +2789,18 @@ impl OnnxRuntimeBackend {
     fn new(
         model_path: PathBuf,
         intra_threads: usize,
-        contract: ResolvedOnnxModelContract,
+        resolution: OnnxContractResolutionConfig,
     ) -> anyhow::Result<Self> {
         let session = OnnxSession::new(model_path, intra_threads)?;
+        let embedded_spec_json = session.read_embedded_contract_json()?;
+        let contract = resolve_onnx_model_contract_from_sources(
+            &session._model_path,
+            resolution.explicit_spec_path.as_deref(),
+            &resolution.input_text_name,
+            &resolution.input_schema_name,
+            &resolution.output_json_name,
+            embedded_spec_json.as_deref(),
+        )?;
         let pipeline = build_onnx_runtime_pipeline(&contract, session.inputs(), session.outputs())?;
 
         Ok(Self {
@@ -2630,12 +2843,11 @@ impl OnnxRuntimeBackend {
     fn new(
         model_path: PathBuf,
         _intra_threads: usize,
-        contract: ResolvedOnnxModelContract,
+        _resolution: OnnxContractResolutionConfig,
     ) -> anyhow::Result<Self> {
         if !model_path.is_file() {
             anyhow::bail!("ONNX model file was not found: {}", model_path.display());
         }
-        let _ = contract;
         anyhow::bail!(
             "this binary was built without the `onnx-runtime` Cargo feature; rebuild with `--features onnx-runtime`"
         )
@@ -3183,6 +3395,8 @@ mod tests {
             listen_addr: "127.0.0.1:0".parse().expect("socket addr"),
             service_name: "test".to_string(),
             log_filter: "info".to_string(),
+            storage_provider: "memory".to_string(),
+            storage_sqlite_path: None,
             extractor_provider: "onnx".to_string(),
             onnx_model_path: None,
             onnx_model_spec_path: None,
@@ -3763,6 +3977,134 @@ mod tests {
         assert!(error.to_string().contains("spec file was not found"));
 
         let _ = fs::remove_file(model_path);
+    }
+
+    #[test]
+    fn embedded_onnx_spec_overrides_sidecar_contract_when_present() {
+        let temp_root =
+            std::env::temp_dir().join(format!("muse-onnx-embedded-spec-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_root).expect("temp dir");
+        let model_path = temp_root.join("uie.onnx");
+        let spec_path = temp_root.join("uie.json");
+        let embedded_tokenizer_path = temp_root.join("embedded-tokenizer.json");
+        let sidecar_tokenizer_path = temp_root.join("sidecar-tokenizer.json");
+        fs::write(&model_path, b"fake-model").expect("write model");
+        fs::write(&embedded_tokenizer_path, b"{}").expect("write embedded tokenizer");
+        fs::write(&sidecar_tokenizer_path, b"{}").expect("write sidecar tokenizer");
+        fs::write(
+            &spec_path,
+            r#"{
+                "protocol_version": 1,
+                "runtime_contract": "string_io",
+                "input_text_name": "sidecar_text",
+                "input_schema_name": "sidecar_schema",
+                "output_json_name": "sidecar_output"
+            }"#,
+        )
+        .expect("write spec");
+
+        let embedded_spec = r#"{
+            "protocol_version": 1,
+            "runtime_contract": "tokenized",
+            "tokenizer_path": "./embedded-tokenizer.json",
+            "max_length": 128,
+            "inputs": {
+                "input_ids": "input_ids",
+                "attention_mask": "attention_mask"
+            },
+            "outputs": {
+                "start_probs": "start_probs",
+                "end_probs": "end_probs"
+            },
+            "decode_strategy": "uie_span"
+        }"#;
+
+        let contract = resolve_onnx_model_contract_from_sources(
+            &model_path,
+            None,
+            "text",
+            "schema",
+            "output",
+            Some(embedded_spec),
+        )
+        .expect("contract");
+
+        assert_eq!(
+            contract.runtime_contract,
+            OnnxRuntimeContractKind::Tokenized
+        );
+        assert_eq!(contract._decode_strategy, OnnxDecodeStrategy::UieSpan);
+        let tokenized = contract.tokenized.as_ref().expect("tokenized contract");
+        assert_eq!(tokenized.tokenizer_path, embedded_tokenizer_path);
+        assert_eq!(contract.input_text_name, "sidecar_text");
+        assert_eq!(contract.input_schema_name, "sidecar_schema");
+        assert_eq!(contract.output_json_name, "sidecar_output");
+
+        let _ = fs::remove_dir_all(temp_root);
+    }
+
+    #[test]
+    fn embedded_onnx_spec_can_fallback_to_sidecar_for_missing_fields() {
+        let temp_root =
+            std::env::temp_dir().join(format!("muse-onnx-merged-spec-{}", Uuid::new_v4()));
+        fs::create_dir_all(&temp_root).expect("temp dir");
+        let model_path = temp_root.join("uie.onnx");
+        let spec_path = temp_root.join("uie.json");
+        let sidecar_tokenizer_path = temp_root.join("sidecar-tokenizer.json");
+        fs::write(&model_path, b"fake-model").expect("write model");
+        fs::write(&sidecar_tokenizer_path, b"{}").expect("write sidecar tokenizer");
+        fs::write(
+            &spec_path,
+            r#"{
+                "protocol_version": 1,
+                "runtime_contract": "tokenized",
+                "tokenizer_path": "./sidecar-tokenizer.json",
+                "max_length": 256,
+                "inputs": {
+                    "input_ids": "input_ids",
+                    "attention_mask": "attention_mask",
+                    "token_type_ids": "token_type_ids"
+                },
+                "outputs": {
+                    "start_probs": "start_probs",
+                    "end_probs": "end_probs"
+                },
+                "decode_strategy": "uie_span"
+            }"#,
+        )
+        .expect("write spec");
+
+        let embedded_spec = r#"{
+            "protocol_version": 1,
+            "runtime_contract": "tokenized",
+            "decode_strategy": "uie_span"
+        }"#;
+
+        let contract = resolve_onnx_model_contract_from_sources(
+            &model_path,
+            None,
+            "text",
+            "schema",
+            "output",
+            Some(embedded_spec),
+        )
+        .expect("contract");
+
+        assert_eq!(
+            contract.runtime_contract,
+            OnnxRuntimeContractKind::Tokenized
+        );
+        let tokenized = contract.tokenized.as_ref().expect("tokenized contract");
+        assert_eq!(tokenized.tokenizer_path, sidecar_tokenizer_path);
+        assert_eq!(tokenized.max_length, 256);
+        assert_eq!(tokenized.inputs.input_ids, "input_ids");
+        assert_eq!(tokenized.inputs.attention_mask, "attention_mask");
+        assert_eq!(
+            tokenized.inputs.token_type_ids.as_deref(),
+            Some("token_type_ids")
+        );
+
+        let _ = fs::remove_dir_all(temp_root);
     }
 
     fn sample_document(plain_text: &str, lines: Vec<&str>) -> DocumentIr {

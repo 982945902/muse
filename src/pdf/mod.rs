@@ -386,6 +386,8 @@ mod tests {
             listen_addr: "127.0.0.1:0".parse().expect("socket addr"),
             service_name: "test".to_string(),
             log_filter: "info".to_string(),
+            storage_provider: "memory".to_string(),
+            storage_sqlite_path: None,
             extractor_provider: "heuristic".to_string(),
             onnx_model_path: None,
             onnx_model_spec_path: None,
